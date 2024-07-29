@@ -19,7 +19,7 @@ pub async fn read_parquet_metadata<Client>(
     client: Arc<Client>,
     bucket: &str,
     key: &str,
-    if_match: ETag,
+    if_match: &ETag,
     total_size: u64,
 ) -> Result<Bytes, PrefetchReadError<Client::ClientError>>
 where
@@ -29,7 +29,7 @@ where
         client,
         bucket: bucket.to_owned(),
         key: key.to_owned(),
-        etag: if_match,
+        etag: if_match.clone(),
         size: total_size,
     };
 
@@ -52,10 +52,10 @@ pub fn parse_byte_ranges(metadata: &ParquetMetaData) -> HashMap<(usize, usize), 
 }
 
 fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<Bytes, ParquetError> {
-    let footer_size = 8;
-    // check file is large enough to hold footer
+    let parquet_magic_len = 8; // Represents the 4 bit "size of metadata" + 4 bit "magic number" (https://parquet.apache.org/docs/file-format/)
+                               // check file is large enough to hold footer
     let file_size = chunk_reader.len();
-    if file_size < (footer_size as u64) {
+    if file_size < (parquet_magic_len as u64) {
         return Err(ParquetError::General(
             "Invalid Parquet file. Size is smaller than footer".to_string(),
         ));
@@ -65,7 +65,7 @@ fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<Bytes, Parquet
     chunk_reader.get_read(file_size - 8, 8)?.read_exact(&mut footer)?;
 
     let metadata_len = decode_footer(&footer)?;
-    let footer_metadata_len = footer_size + metadata_len;
+    let footer_metadata_len = parquet_magic_len + metadata_len;
 
     if footer_metadata_len > file_size as usize {
         return Err(ParquetError::General(
@@ -74,7 +74,6 @@ fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<Bytes, Parquet
     }
 
     let metadata = chunk_reader.get_bytes(file_size - footer_metadata_len as u64, metadata_len)?;
-
     Ok(metadata)
 }
 
@@ -115,15 +114,16 @@ struct S3ReadSeek<Client: ObjectClient> {
 impl<Client: ObjectClient + Send + Sync + 'static> Read for S3ReadSeek<Client> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         trace!("Entered here for reader s3seek??");
-
-        let range = self.position..(self.position + self.length.min(buf.len()) as u64).min(self.size);
-        if range.is_empty() {
-            return Ok(0);
-        }
+        let range_start = self.position;
+        let range_end = (self.position + self.length.min(buf.len()) as u64).min(self.size);
+        let range: std::ops::Range<u64> = range_start..range_end;
 
         let span = debug_span!("read", range = ?range);
         let _enter = span.enter();
 
+        if range.is_empty() {
+            return Ok(0);
+        }
         let expected_size = range.end - range.start;
         let mut data = Vec::with_capacity(expected_size as usize);
 

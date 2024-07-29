@@ -15,14 +15,11 @@ mod part_stream;
 mod seek_window;
 mod task;
 
-use crate::checksums::{ChecksummedBytes, IntegrityError};
-use crate::data_cache::DataCache;
-use crate::object::ObjectId;
-use crate::prefetch::caching_stream::CachingPartStream;
-use crate::prefetch::part_stream::{ClientPartStream, ObjectPartStream, RequestRange};
-use crate::prefetch::seek_window::SeekWindow;
-use crate::prefetch::task::RequestTask;
-use crate::sync::Arc;
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::task::Spawn;
@@ -32,13 +29,18 @@ use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
 use parquet::file::footer::decode_metadata;
 use parquet_prefetch::{parse_byte_ranges, read_parquet_metadata};
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::fmt::Debug;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::trace;
+
+use crate::checksums::{ChecksummedBytes, IntegrityError};
+use crate::data_cache::DataCache;
+use crate::object::ObjectId;
+use crate::prefetch::caching_stream::CachingPartStream;
+use crate::prefetch::part_stream::{ClientPartStream, ObjectPartStream, RequestRange};
+use crate::prefetch::seek_window::SeekWindow;
+use crate::prefetch::task::RequestTask;
+use crate::sync::Arc;
 
 /// Generic interface to handle reading data from an object.
 pub trait Prefetch {
@@ -98,7 +100,7 @@ where
 
 pub type ParquetPrefetcher<Runtime> = Prefetcher<ClientPartStream<Runtime>>;
 
-// Creates an instance of the parquet-specific [Prefetch].
+/// Creates an instance of the parquet-specific [Prefetch].
 pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
 where
     Runtime: Spawn + Send + Sync + 'static,
@@ -214,8 +216,10 @@ where
     }
 }
 
-type ParsedMetadata = Arc<RwLock<Option<HashMap<(usize, usize), (u64, u64)>>>>;
+type ParsedMetadata = Arc<RwLock<Option<HashMap<(ColumnIndex, RowGroupIndex), (u64, u64)>>>>;
 type RawMetadata = Arc<RwLock<Option<Bytes>>>;
+type RowGroupIndex = usize;
+type ColumnIndex = usize;
 
 /// A GetObject request that divides the desired range of the object into chunks that it prefetches
 /// in a way that maximizes throughput from S3.
@@ -320,6 +324,11 @@ where
             let metadata = self.load_parquet_metadata().await?;
             *metadata_write = Some(metadata);
         }
+        drop(metadata_write);
+
+        trace!("Metadata For Reference: {:?}", &self.parsed_metadata);
+        trace!("Raw Metadata For Reference: {:?}", &self.raw_metadata);
+
         Ok(())
     }
 
@@ -331,7 +340,7 @@ where
             self.client.clone(),
             &self.bucket,
             self.object_id.key(),
-            self.object_id.etag().clone(),
+            self.object_id.etag(),
             self.size,
         )
         .await?;
@@ -354,9 +363,6 @@ where
         if self.object_id.key().ends_with(".parquet") {
             self.ensure_parquet_metadata_loaded().await?;
         }
-
-        trace!("Metadata For Reference: {:?}", &self.parsed_metadata);
-        trace!("Raw Metadata For Reference: {:?}", &self.raw_metadata);
 
         // Currently, we set preferred part size to the current read size.
         // Our assumption is that the read size will be the same for most sequential
