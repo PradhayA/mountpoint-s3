@@ -8,24 +8,12 @@
 //! non-sequential read, we abandon the prefetching and start again with the minimum request size.
 
 mod caching_stream;
+mod parquet_prefetch;
 mod part;
 mod part_queue;
 mod part_stream;
 mod seek_window;
 mod task;
-
-use std::collections::VecDeque;
-use std::fmt::Debug;
-use std::time::Duration;
-
-use async_trait::async_trait;
-use futures::task::Spawn;
-use metrics::{counter, histogram};
-use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
-use mountpoint_s3_client::types::ETag;
-use mountpoint_s3_client::ObjectClient;
-use thiserror::Error;
-use tracing::trace;
 
 use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::data_cache::DataCache;
@@ -35,6 +23,22 @@ use crate::prefetch::part_stream::{ClientPartStream, ObjectPartStream, RequestRa
 use crate::prefetch::seek_window::SeekWindow;
 use crate::prefetch::task::RequestTask;
 use crate::sync::Arc;
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::task::Spawn;
+use metrics::{counter, histogram};
+use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
+use mountpoint_s3_client::types::ETag;
+use mountpoint_s3_client::ObjectClient;
+use parquet::file::footer:: decode_metadata;
+use parquet_prefetch::{parse_byte_ranges, read_parquet_metadata};
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::time::Duration;
+use thiserror::Error;
+use tokio::sync::RwLock;
+use tracing::trace;
 
 /// Generic interface to handle reading data from an object.
 pub trait Prefetch {
@@ -85,6 +89,17 @@ pub type DefaultPrefetcher<Runtime> = Prefetcher<ClientPartStream<Runtime>>;
 
 /// Creates an instance of the default [Prefetch].
 pub fn default_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> DefaultPrefetcher<Runtime>
+where
+    Runtime: Spawn + Send + Sync + 'static,
+{
+    let part_stream = ClientPartStream::new(runtime);
+    Prefetcher::new(part_stream, prefetcher_config)
+}
+
+pub type ParquetPrefetcher<Runtime> = Prefetcher<ClientPartStream<Runtime>>;
+
+// Creates an instance of the parquet-specific [Prefetch].
+pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
 where
     Runtime: Spawn + Send + Sync + 'static,
 {
@@ -224,6 +239,8 @@ pub struct PrefetchGetObject<Stream: ObjectPartStream, Client: ObjectClient> {
     next_request_size: usize,
     next_request_offset: u64,
     size: u64,
+    parsed_metadata: Arc<RwLock<Option<HashMap<(usize, usize), (u64, u64)>>>>,
+    raw_metadata: Arc<RwLock<Option<Bytes>>>,
 }
 
 #[async_trait]
@@ -284,7 +301,45 @@ where
             bucket: bucket.to_owned(),
             object_id: ObjectId::new(key.to_owned(), etag),
             size,
+            parsed_metadata: Arc::new(RwLock::new(None)),
+            raw_metadata: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Ensures that the Parquet metadata is loaded, parsing and caching it if not already done.
+    async fn ensure_parquet_metadata_loaded(&self) -> Result<(), PrefetchReadError<Client::ClientError>> {
+        if self.parsed_metadata.read().await.is_some() {
+            return Ok(());
+        }
+
+        let mut metadata_write = self.parsed_metadata.write().await;
+        if metadata_write.is_none() {
+            let metadata = self.load_parquet_metadata().await?;
+            *metadata_write = Some(metadata);
+        }
+        Ok(())
+    }
+
+    /// Loads the Parquet metadata from the object store.
+    async fn load_parquet_metadata(
+        &self,
+    ) -> Result<HashMap<(usize, usize), (u64, u64)>, PrefetchReadError<Client::ClientError>> {
+        let raw_metadata = read_parquet_metadata(
+            self.client.clone(),
+            &self.bucket,
+            self.object_id.key(),
+            self.object_id.etag().clone(),
+            self.size,
+        )
+        .await?;
+
+        let metadata =
+            decode_metadata(&raw_metadata).map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
+
+        let mut raw_metadata_write = self.raw_metadata.write().await;
+        *raw_metadata_write = Some(raw_metadata);
+
+        Ok(parse_byte_ranges(&metadata))
     }
 
     async fn try_read(
@@ -292,6 +347,14 @@ where
         offset: u64,
         length: usize,
     ) -> Result<ChecksummedBytes, PrefetchReadError<Client::ClientError>> {
+        // Initially check if file is a parquet file
+        if self.object_id.key().ends_with(".parquet") {
+            self.ensure_parquet_metadata_loaded().await?;
+        }
+
+        trace!("Metadata For Reference: {:?}", &self.parsed_metadata);
+        trace!("Raw Metadata For Reference: {:?}", &self.raw_metadata);
+
         // Currently, we set preferred part size to the current read size.
         // Our assumption is that the read size will be the same for most sequential
         // read and it can be aligned to the size of prefetched chunks.
