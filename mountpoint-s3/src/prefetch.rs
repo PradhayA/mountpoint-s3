@@ -30,7 +30,7 @@ use metrics::{counter, histogram};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
-use parquet::file::footer:: decode_metadata;
+use parquet::file::footer::decode_metadata;
 use parquet_prefetch::{parse_byte_ranges, read_parquet_metadata};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -214,6 +214,9 @@ where
     }
 }
 
+type ParsedMetadata = Arc<RwLock<Option<HashMap<(usize, usize), (u64, u64)>>>>;
+type RawMetadata = Arc<RwLock<Option<Bytes>>>;
+
 /// A GetObject request that divides the desired range of the object into chunks that it prefetches
 /// in a way that maximizes throughput from S3.
 #[derive(Debug)]
@@ -239,8 +242,8 @@ pub struct PrefetchGetObject<Stream: ObjectPartStream, Client: ObjectClient> {
     next_request_size: usize,
     next_request_offset: u64,
     size: u64,
-    parsed_metadata: Arc<RwLock<Option<HashMap<(usize, usize), (u64, u64)>>>>,
-    raw_metadata: Arc<RwLock<Option<Bytes>>>,
+    parsed_metadata: ParsedMetadata,
+    raw_metadata: RawMetadata,
 }
 
 #[async_trait]

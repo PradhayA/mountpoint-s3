@@ -1,5 +1,4 @@
 use crate::sync::Arc;
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::StreamExt;
@@ -76,7 +75,7 @@ fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<Bytes, Parquet
 
     let metadata = chunk_reader.get_bytes(file_size - footer_metadata_len as u64, metadata_len)?;
 
-    return Ok(metadata);
+    Ok(metadata)
 }
 
 struct ParquetS3ChunkReader<Client: ObjectClient> {
