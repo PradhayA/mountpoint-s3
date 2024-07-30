@@ -2,13 +2,13 @@ use crate::sync::Arc;
 use bytes::Bytes;
 use futures::pin_mut;
 use futures::StreamExt;
+use intervaltree::IntervalTree;
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
 use parquet::errors::ParquetError;
 use parquet::file::footer::decode_footer;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{ChunkReader, Length};
-use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use tracing::debug_span;
 use tracing::trace;
@@ -36,19 +36,30 @@ where
     parse_metadata_raw(&chunk_reader).map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)
 }
 
-pub fn parse_byte_ranges(metadata: &ParquetMetaData) -> HashMap<(usize, usize), (u64, u64)> {
-    let mut byte_ranges = HashMap::new();
+pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (usize, usize)> {
+    // Stored as an interval tree, where the key is the start and end byte of the column chunk, and the value is the rowgroup and column index
+    // This allows us to efficiently find the column chunk for a given byte offset
+    // The value is stored as a tuple of (rowgroup_index, column_index) to allow for easy retrieval of the column metadata
+    // Overall, this approach has a time complexity of O(n log n) for constructing the tree, and O(log n) for lookup, resulting in an efficient solution for finding the column chunk for a given byte offset
+    
+    let elements = metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .flat_map(|(rowgroup_index, rowgroup)| {
+            rowgroup
+                .columns()
+                .iter()
+                .enumerate()
+                .map(move |(column_index, column_metadata)| {
+                    let start_byte = column_metadata.file_offset() as u64;
+                    let end_byte = start_byte + column_metadata.compressed_size() as u64 - 1;
+                    (start_byte..end_byte, (rowgroup_index, column_index))
+                })
+        })
+        .collect::<Vec<_>>();
 
-    for (rowgroup_index, rowgroup) in metadata.row_groups().iter().enumerate() {
-        for (column_index, column_metadata) in rowgroup.columns().iter().enumerate() {
-            let start_byte = column_metadata.file_offset() as u64;
-            let end_byte = start_byte + column_metadata.compressed_size() as u64 - 1;
-
-            byte_ranges.insert((rowgroup_index, column_index), (start_byte, end_byte));
-        }
-    }
-
-    byte_ranges
+    IntervalTree::from_iter(elements)
 }
 
 fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<Bytes, ParquetError> {
@@ -178,4 +189,19 @@ impl<Client: ObjectClient> Length for ParquetS3ChunkReader<Client> {
     fn len(&self) -> u64 {
         self.size
     }
+}
+
+pub fn get_row_groups_and_columns(
+    interval_tree: &IntervalTree<u64, (usize, usize)>,
+    start_byte: u64,
+    end_byte: u64,
+) -> Vec<((usize, usize), (u64, u64))> {
+    interval_tree
+        .query(start_byte..end_byte)
+        .map(|element| {
+            let intersection_start = start_byte.max(element.range.start);
+            let intersection_end = end_byte.min(element.range.end);
+            (element.value, (intersection_start, intersection_end))
+        })
+        .collect()
 }

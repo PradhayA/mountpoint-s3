@@ -15,7 +15,6 @@ mod part_stream;
 mod seek_window;
 mod task;
 
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::time::Duration;
@@ -23,12 +22,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::task::Spawn;
+use intervaltree::IntervalTree;
 use metrics::{counter, histogram};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
 use parquet::file::footer::decode_metadata;
-use parquet_prefetch::{parse_byte_ranges, read_parquet_metadata};
+use parquet_prefetch::{parse_byte_ranges_tree, read_parquet_metadata, get_row_groups_and_columns};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::trace;
@@ -216,7 +216,7 @@ where
     }
 }
 
-type ParsedMetadata = Arc<RwLock<Option<HashMap<(ColumnIndex, RowGroupIndex), (u64, u64)>>>>;
+type ParsedMetadata = Arc<RwLock<Option<IntervalTree<u64, (RowGroupIndex, ColumnIndex)>>>>;
 type RawMetadata = Arc<RwLock<Option<Bytes>>>;
 type RowGroupIndex = usize;
 type ColumnIndex = usize;
@@ -332,10 +332,10 @@ where
         Ok(())
     }
 
-    /// Loads the Parquet metadata from the object store.
+    /// Loads the Parquet metadata from the object store and stores it as a tree.
     async fn load_parquet_metadata(
         &self,
-    ) -> Result<HashMap<(usize, usize), (u64, u64)>, PrefetchReadError<Client::ClientError>> {
+    ) -> Result<IntervalTree<u64, (usize, usize)>, PrefetchReadError<Client::ClientError>> {
         let raw_metadata = read_parquet_metadata(
             self.client.clone(),
             &self.bucket,
@@ -351,7 +351,7 @@ where
         let mut raw_metadata_write = self.raw_metadata.write().await;
         *raw_metadata_write = Some(raw_metadata);
 
-        Ok(parse_byte_ranges(&metadata))
+        Ok(parse_byte_ranges_tree(&metadata))
     }
 
     async fn try_read(
@@ -362,7 +362,14 @@ where
         // Initially check if file is a parquet file
         if self.object_id.key().ends_with(".parquet") {
             self.ensure_parquet_metadata_loaded().await?;
-        }
+
+            let interval_tree = self.parsed_metadata.read().await;
+            if let Some(interval_tree) = interval_tree.as_ref() {
+                let row_groups_and_columns = get_row_groups_and_columns(interval_tree, offset, offset + length as u64);
+                trace!("Row groups and columns: {:?}", row_groups_and_columns);
+                // TODO: Now we got this, use the row_groups_and_columns information to optimise reads
+            }
+        }              
 
         // Currently, we set preferred part size to the current read size.
         // Our assumption is that the read size will be the same for most sequential
