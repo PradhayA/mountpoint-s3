@@ -17,6 +17,7 @@ mod task;
 
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::ops::Range;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -217,7 +218,7 @@ where
 }
 
 type ParsedMetadata = Arc<RwLock<Option<IntervalTree<u64, (RowGroupIndex, ColumnIndex)>>>>;
-type RawMetadata = Arc<RwLock<Option<Bytes>>>;
+type RawMetadata = Arc<RwLock<Option<(Bytes, Range<u64>)>>>;
 type RowGroupIndex = usize;
 type ColumnIndex = usize;
 
@@ -336,7 +337,7 @@ where
     async fn load_parquet_metadata(
         &self,
     ) -> Result<IntervalTree<u64, (usize, usize)>, PrefetchReadError<Client::ClientError>> {
-        let raw_metadata = read_parquet_metadata(
+        let (raw_metadata, metadata_range) = read_parquet_metadata(
             self.client.clone(),
             &self.bucket,
             self.object_id.key(),
@@ -344,15 +345,16 @@ where
             self.size,
         )
         .await?;
-
-        let metadata =
-            decode_metadata(&raw_metadata).map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
-
+    
+        let metadata_len = raw_metadata.len() - 8;
+        let metadata = decode_metadata(&raw_metadata[..metadata_len])
+            .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
+    
         let mut raw_metadata_write = self.raw_metadata.write().await;
-        *raw_metadata_write = Some(raw_metadata);
-
+        *raw_metadata_write = Some((raw_metadata, metadata_range));
+    
         Ok(parse_byte_ranges_tree(&metadata))
-    }
+    }    
 
     async fn try_read(
         &mut self,

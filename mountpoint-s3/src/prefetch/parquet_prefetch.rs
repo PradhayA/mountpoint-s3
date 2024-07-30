@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::pin_mut;
 use futures::StreamExt;
 use intervaltree::IntervalTree;
@@ -21,7 +21,7 @@ pub async fn read_parquet_metadata<Client>(
     key: &str,
     if_match: &ETag,
     total_size: u64,
-) -> Result<Bytes, PrefetchReadError<Client::ClientError>>
+) -> Result<(Bytes, std::ops::Range<u64>), PrefetchReadError<Client::ClientError>>
 where
     Client: ObjectClient + Send + Sync + 'static,
 {
@@ -33,8 +33,17 @@ where
         size: total_size,
     };
 
-    parse_metadata_raw(&chunk_reader).map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)
+    let (metadata, footer, metadata_range) = parse_metadata_raw(&chunk_reader)
+        .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
+    
+    let mut combined = BytesMut::with_capacity(metadata.len() + footer.len());
+    combined.extend_from_slice(&metadata);
+    combined.extend_from_slice(&footer);
+    
+    Ok((combined.freeze(), metadata_range))
 }
+
+
 
 pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (usize, usize)> {
     // Stored as an interval tree, where the key is the start and end byte of the column chunk, and the value is the rowgroup and column index
@@ -62,9 +71,8 @@ pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (
     IntervalTree::from_iter(elements)
 }
 
-fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<Bytes, ParquetError> {
-    let parquet_magic_len = 8; // Represents the 4 bit "size of metadata" + 4 bit "magic number" (https://parquet.apache.org/docs/file-format/)
-                               // check file is large enough to hold footer
+fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<(Bytes, [u8; 8], std::ops::Range<u64>), ParquetError> {
+    let parquet_magic_len = 8;
     let file_size = chunk_reader.len();
     if file_size < (parquet_magic_len as u64) {
         return Err(ParquetError::General(
@@ -84,9 +92,13 @@ fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<Bytes, Parquet
         ));
     }
 
-    let metadata = chunk_reader.get_bytes(file_size - footer_metadata_len as u64, metadata_len)?;
-    Ok(metadata)
+    let metadata_start = file_size - footer_metadata_len as u64;
+    let metadata_range = metadata_start..file_size;
+    let metadata = chunk_reader.get_bytes(metadata_start, metadata_len)?;
+
+    Ok((metadata, footer, metadata_range))
 }
+
 
 struct ParquetS3ChunkReader<Client: ObjectClient> {
     client: Arc<Client>,
