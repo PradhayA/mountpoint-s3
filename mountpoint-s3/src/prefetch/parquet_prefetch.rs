@@ -8,12 +8,11 @@ use mountpoint_s3_client::ObjectClient;
 use parquet::errors::ParquetError;
 use parquet::file::footer::decode_footer;
 use parquet::file::metadata::ParquetMetaData;
-use parquet::file::reader::{ChunkReader, Length};
-use std::io::{Read, Seek, SeekFrom};
-use tracing::debug_span;
 use tracing::trace;
 
 use super::PrefetchReadError;
+
+const PARQUET_MAGIC_LEN: usize = 8;
 
 pub async fn read_parquet_metadata<Client>(
     client: Arc<Client>,
@@ -25,32 +24,101 @@ pub async fn read_parquet_metadata<Client>(
 where
     Client: ObjectClient + Send + Sync + 'static,
 {
-    let chunk_reader = ParquetS3ChunkReader {
-        client,
-        bucket: bucket.to_owned(),
-        key: key.to_owned(),
-        etag: if_match.clone(),
-        size: total_size,
-    };
-
-    let (metadata, footer, metadata_range) = parse_metadata_raw(&chunk_reader)
-        .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
-    
-    let mut combined = BytesMut::with_capacity(metadata.len() + footer.len());
-    combined.extend_from_slice(&metadata);
-    combined.extend_from_slice(&footer);
-    
-    Ok((combined.freeze(), metadata_range))
+    fetch_metadata(client, bucket, key, if_match, total_size)
+        .await
+        .map(|(metadata, footer, metadata_range)| {
+            let mut combined = BytesMut::with_capacity(metadata.len() + PARQUET_MAGIC_LEN);
+            combined.extend_from_slice(&metadata);
+            combined.extend_from_slice(&footer);
+            (combined.freeze(), metadata_range)
+        })
+        .map_err(|_| PrefetchReadError::MetadataParsingFailed)
 }
 
+async fn fetch_metadata<Client>(
+    client: Arc<Client>,
+    bucket: &str,
+    key: &str,
+    if_match: &ETag,
+    total_size: u64,
+) -> Result<(Bytes, [u8; PARQUET_MAGIC_LEN], std::ops::Range<u64>), ParquetError>
+where
+    Client: ObjectClient + Send + Sync + 'static,
+{
+    if total_size < PARQUET_MAGIC_LEN as u64 {
+        return Err(ParquetError::General(
+            "Invalid Parquet file. Size is smaller than footer".to_string(),
+        ));
+    }
 
+    let mut footer = [0_u8; PARQUET_MAGIC_LEN];
+    let footer_range = (total_size - PARQUET_MAGIC_LEN as u64)..total_size;
+
+    fetch_object_part(&client, bucket, key, if_match, footer_range.clone(), |body| {
+        footer.copy_from_slice(&body[..PARQUET_MAGIC_LEN])
+    })
+    .await?;
+
+    let metadata_len = decode_footer(&footer)?;
+    let footer_metadata_len = PARQUET_MAGIC_LEN + metadata_len;
+
+    if footer_metadata_len > total_size as usize {
+        return Err(ParquetError::General(
+            "Invalid Parquet file. Reported metadata length is shorter than expected".to_string(),
+        ));
+    }
+
+    let metadata_start = total_size - footer_metadata_len as u64;
+    let metadata_range = metadata_start..total_size;
+
+    let mut metadata = BytesMut::new();
+    fetch_object_part(&client, bucket, key, if_match, metadata_range.clone(), |body| {
+        metadata.extend_from_slice(&body)
+    })
+    .await?;
+
+    Ok((metadata.freeze(), footer, metadata_range))
+}
+
+async fn fetch_object_part<Client, F>(
+    client: &Arc<Client>,
+    bucket: &str,
+    key: &str,
+    if_match: &ETag,
+    range: std::ops::Range<u64>,
+    mut handle_body: F,
+) -> Result<(), ParquetError>
+where
+    Client: ObjectClient + Send + Sync + 'static,
+    F: FnMut(&[u8]),
+{
+    let get_object_result = client
+        .get_object(bucket, key, Some(range), Some(if_match.clone()))
+        .await
+        .map_err(|e| ParquetError::General(format!("Error fetching object part: {}", e)))?;
+
+    pin_mut!(get_object_result);
+
+    while let Some(result) = get_object_result.next().await {
+        match result {
+            Ok((_, body)) => {
+                trace!(length = body.len(), "received part");
+                metrics::counter!("s3.client.total_bytes", "type" => "read").increment(body.len() as u64);
+                handle_body(&body);
+            }
+            Err(e) => return Err(ParquetError::General(format!("Error fetching object part: {}", e))),
+        }
+    }
+
+    Ok(())
+}
 
 pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (usize, usize)> {
     // Stored as an interval tree, where the key is the start and end byte of the column chunk, and the value is the rowgroup and column index
     // This allows us to efficiently find the column chunk for a given byte offset
     // The value is stored as a tuple of (rowgroup_index, column_index) to allow for easy retrieval of the column metadata
     // Overall, this approach has a time complexity of O(n log n) for constructing the tree, and O(log n) for lookup, resulting in an efficient solution for finding the column chunk for a given byte offset
-    
+
     let elements = metadata
         .row_groups()
         .iter()
@@ -69,138 +137,6 @@ pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (
         .collect::<Vec<_>>();
 
     IntervalTree::from_iter(elements)
-}
-
-fn parse_metadata_raw<R: ChunkReader>(chunk_reader: &R) -> Result<(Bytes, [u8; 8], std::ops::Range<u64>), ParquetError> {
-    let parquet_magic_len = 8;
-    let file_size = chunk_reader.len();
-    if file_size < (parquet_magic_len as u64) {
-        return Err(ParquetError::General(
-            "Invalid Parquet file. Size is smaller than footer".to_string(),
-        ));
-    }
-
-    let mut footer = [0_u8; 8];
-    chunk_reader.get_read(file_size - 8, 8)?.read_exact(&mut footer)?;
-
-    let metadata_len = decode_footer(&footer)?;
-    let footer_metadata_len = parquet_magic_len + metadata_len;
-
-    if footer_metadata_len > file_size as usize {
-        return Err(ParquetError::General(
-            "Invalid Parquet file. Reported metadata length is shorter than expected".to_string(),
-        ));
-    }
-
-    let metadata_start = file_size - footer_metadata_len as u64;
-    let metadata_range = metadata_start..file_size;
-    let metadata = chunk_reader.get_bytes(metadata_start, metadata_len)?;
-
-    Ok((metadata, footer, metadata_range))
-}
-
-
-struct ParquetS3ChunkReader<Client: ObjectClient> {
-    client: Arc<Client>,
-    bucket: String,
-    key: String,
-    etag: ETag,
-    size: u64,
-}
-
-impl<Client: ObjectClient + Send + Sync + 'static> ChunkReader for ParquetS3ChunkReader<Client> {
-    type T = S3ReadSeek<Client>;
-
-    fn get_read(&self, start: u64, length: usize) -> Result<Self::T, ParquetError> {
-        Ok(S3ReadSeek {
-            client: self.client.clone(),
-            bucket: self.bucket.clone(),
-            key: self.key.clone(),
-            etag: self.etag.clone(),
-            position: start,
-            size: self.size,
-            length,
-        })
-    }
-}
-
-struct S3ReadSeek<Client: ObjectClient> {
-    client: Arc<Client>,
-    bucket: String,
-    key: String,
-    etag: ETag,
-    position: u64,
-    size: u64,
-    length: usize,
-}
-
-impl<Client: ObjectClient + Send + Sync + 'static> Read for S3ReadSeek<Client> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        trace!("Entered here for reader s3seek??");
-        let range_start = self.position;
-        let range_end = (self.position + self.length.min(buf.len()) as u64).min(self.size);
-        let range: std::ops::Range<u64> = range_start..range_end;
-
-        let span = debug_span!("read", range = ?range);
-        let _enter = span.enter();
-
-        if range.is_empty() {
-            return Ok(0);
-        }
-        let expected_size = range.end - range.start;
-        let mut data = Vec::with_capacity(expected_size as usize);
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        let read_len = runtime.block_on(async {
-            let get_object_result = self
-                .client
-                .get_object(&self.bucket, &self.key, Some(range), Some(self.etag.clone()))
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-            pin_mut!(get_object_result);
-
-            while let Some(result) = get_object_result.next().await {
-                match result {
-                    Ok((_, body)) => {
-                        trace!(length = body.len(), "received part");
-                        metrics::counter!("s3.client.total_bytes", "type" => "read").increment(body.len() as u64);
-                        data.extend_from_slice(&body);
-                    }
-                    Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
-                }
-            }
-
-            trace!("data fetched");
-            Ok(data.len())
-        })?;
-
-        buf[..read_len].copy_from_slice(&data);
-        self.position += read_len as u64;
-        self.length -= read_len;
-        Ok(read_len)
-    }
-}
-
-impl<Client: ObjectClient> Seek for S3ReadSeek<Client> {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.position = match pos {
-            SeekFrom::Start(offset) => offset,
-            SeekFrom::End(offset) => (self.size as i64 + offset) as u64,
-            SeekFrom::Current(offset) => (self.position as i64 + offset) as u64,
-        };
-        Ok(self.position)
-    }
-}
-
-impl<Client: ObjectClient> Length for ParquetS3ChunkReader<Client> {
-    fn len(&self) -> u64 {
-        self.size
-    }
 }
 
 pub fn get_row_groups_and_columns(

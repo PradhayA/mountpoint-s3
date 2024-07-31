@@ -29,9 +29,8 @@ use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
 use parquet::file::footer::decode_metadata;
-use parquet_prefetch::{parse_byte_ranges_tree, read_parquet_metadata, get_row_groups_and_columns};
+use parquet_prefetch::{get_row_groups_and_columns, parse_byte_ranges_tree, read_parquet_metadata};
 use thiserror::Error;
-use tokio::sync::RwLock;
 use tracing::trace;
 
 use crate::checksums::{ChecksummedBytes, IntegrityError};
@@ -42,6 +41,7 @@ use crate::prefetch::part_stream::{ClientPartStream, ObjectPartStream, RequestRa
 use crate::prefetch::seek_window::SeekWindow;
 use crate::prefetch::task::RequestTask;
 use crate::sync::Arc;
+pub use async_lock::RwLock as AsyncRwLock;
 
 /// Generic interface to handle reading data from an object.
 pub trait Prefetch {
@@ -86,6 +86,9 @@ pub enum PrefetchReadError<E> {
 
     #[error("integrity check failed")]
     Integrity(#[from] IntegrityError),
+
+    #[error("metadata parsing failed")]
+    MetadataParsingFailed,
 }
 
 pub type DefaultPrefetcher<Runtime> = Prefetcher<ClientPartStream<Runtime>>;
@@ -217,8 +220,8 @@ where
     }
 }
 
-type ParsedMetadata = Arc<RwLock<Option<IntervalTree<u64, (RowGroupIndex, ColumnIndex)>>>>;
-type RawMetadata = Arc<RwLock<Option<(Bytes, Range<u64>)>>>;
+type ParsedMetadata = Arc<AsyncRwLock<Option<IntervalTree<u64, (RowGroupIndex, ColumnIndex)>>>>;
+type RawMetadata = Arc<AsyncRwLock<Option<(Bytes, Range<u64>)>>>;
 type RowGroupIndex = usize;
 type ColumnIndex = usize;
 
@@ -249,6 +252,7 @@ pub struct PrefetchGetObject<Stream: ObjectPartStream, Client: ObjectClient> {
     size: u64,
     parsed_metadata: ParsedMetadata,
     raw_metadata: RawMetadata,
+    should_parse_metadata: bool,
 }
 
 #[async_trait]
@@ -309,8 +313,9 @@ where
             bucket: bucket.to_owned(),
             object_id: ObjectId::new(key.to_owned(), etag),
             size,
-            parsed_metadata: Arc::new(RwLock::new(None)),
-            raw_metadata: Arc::new(RwLock::new(None)),
+            parsed_metadata: Default::default(),
+            raw_metadata: Default::default(),
+            should_parse_metadata: true,
         }
     }
 
@@ -345,16 +350,16 @@ where
             self.size,
         )
         .await?;
-    
+
         let metadata_len = raw_metadata.len() - 8;
         let metadata = decode_metadata(&raw_metadata[..metadata_len])
             .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
-    
+
         let mut raw_metadata_write = self.raw_metadata.write().await;
         *raw_metadata_write = Some((raw_metadata, metadata_range));
-    
+
         Ok(parse_byte_ranges_tree(&metadata))
-    }    
+    }
 
     async fn try_read(
         &mut self,
@@ -362,16 +367,23 @@ where
         length: usize,
     ) -> Result<ChecksummedBytes, PrefetchReadError<Client::ClientError>> {
         // Initially check if file is a parquet file
-        if self.object_id.key().ends_with(".parquet") {
-            self.ensure_parquet_metadata_loaded().await?;
-
-            let interval_tree = self.parsed_metadata.read().await;
-            if let Some(interval_tree) = interval_tree.as_ref() {
-                let row_groups_and_columns = get_row_groups_and_columns(interval_tree, offset, offset + length as u64);
-                trace!("Row groups and columns: {:?}", row_groups_and_columns);
-                // TODO: Now we got this, use the row_groups_and_columns information to optimise reads
+        if self.object_id.key().ends_with(".parquet") && self.should_parse_metadata {
+            match self.ensure_parquet_metadata_loaded().await {
+                Ok(_) => {
+                    trace!("Parquet file detected, parsing metadata");
+                    let interval_tree = self.parsed_metadata.read().await;
+                    if let Some(interval_tree) = interval_tree.as_ref() {
+                        let row_groups_and_columns =
+                            get_row_groups_and_columns(interval_tree, offset, offset + length as u64);
+                        trace!("Row groups and columns: {:?}", row_groups_and_columns);
+                        // TODO: Now we got this, use the row_groups_and_columns information to optimise reads
+                    }
+                }
+                Err(_) => {
+                    self.should_parse_metadata = false;
+                }
             }
-        }              
+        }
 
         // Currently, we set preferred part size to the current read size.
         // Our assumption is that the read size will be the same for most sequential

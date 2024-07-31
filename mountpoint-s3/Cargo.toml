@@ -45,7 +45,6 @@ tracing-log = "0.2.0"
 tracing-subscriber = { version = "0.3.14", features = ["env-filter"] }
 parquet = "25.0.0"
 intervaltree = "0.2.7"
-tokio = { version = "1.24.2", features = ["rt", "macros", "sync"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { version = "0.16.0", default-features = false }
 
