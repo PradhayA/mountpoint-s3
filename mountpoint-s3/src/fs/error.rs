@@ -131,6 +131,7 @@ impl<E: std::error::Error + Send + Sync + 'static> From<PrefetchReadError<E>> fo
             PrefetchReadError::Integrity(e) => err!(libc::EIO, source:e, "integrity error"),
             PrefetchReadError::GetRequestFailed(_)
             | PrefetchReadError::GetRequestTerminatedUnexpectedly
+            | PrefetchReadError::MetadataParsingFailed
             | PrefetchReadError::GetRequestReturnedWrongOffset { .. } => {
                 err!(libc::EIO, source:err, "get request failed")
             }

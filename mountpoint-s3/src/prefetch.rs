@@ -8,6 +8,7 @@
 //! non-sequential read, we abandon the prefetching and start again with the minimum request size.
 
 mod caching_stream;
+mod parquet_prefetch;
 mod part;
 mod part_queue;
 mod part_stream;
@@ -16,14 +17,19 @@ mod task;
 
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::ops::Range;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::task::Spawn;
+use intervaltree::IntervalTree;
 use metrics::{counter, histogram};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
+use parquet::file::footer::decode_metadata;
+use parquet_prefetch::{get_row_groups_and_columns, parse_byte_ranges_tree, read_parquet_metadata};
 use thiserror::Error;
 use tracing::trace;
 
@@ -35,6 +41,7 @@ use crate::prefetch::part_stream::{ClientPartStream, ObjectPartStream, RequestRa
 use crate::prefetch::seek_window::SeekWindow;
 use crate::prefetch::task::RequestTask;
 use crate::sync::Arc;
+pub use async_lock::RwLock as AsyncRwLock;
 
 /// Generic interface to handle reading data from an object.
 pub trait Prefetch {
@@ -79,12 +86,26 @@ pub enum PrefetchReadError<E> {
 
     #[error("integrity check failed")]
     Integrity(#[from] IntegrityError),
+
+    #[error("metadata parsing failed")]
+    MetadataParsingFailed,
 }
 
 pub type DefaultPrefetcher<Runtime> = Prefetcher<ClientPartStream<Runtime>>;
 
 /// Creates an instance of the default [Prefetch].
 pub fn default_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> DefaultPrefetcher<Runtime>
+where
+    Runtime: Spawn + Send + Sync + 'static,
+{
+    let part_stream = ClientPartStream::new(runtime);
+    Prefetcher::new(part_stream, prefetcher_config)
+}
+
+pub type ParquetPrefetcher<Runtime> = Prefetcher<ClientPartStream<Runtime>>;
+
+/// Creates an instance of the parquet-specific [Prefetch].
+pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
 where
     Runtime: Spawn + Send + Sync + 'static,
 {
@@ -199,6 +220,11 @@ where
     }
 }
 
+type ParsedMetadata = Arc<AsyncRwLock<Option<IntervalTree<u64, (RowGroupIndex, ColumnIndex)>>>>;
+type RawMetadata = Arc<AsyncRwLock<Option<(Bytes, Range<u64>)>>>;
+type RowGroupIndex = usize;
+type ColumnIndex = usize;
+
 /// A GetObject request that divides the desired range of the object into chunks that it prefetches
 /// in a way that maximizes throughput from S3.
 #[derive(Debug)]
@@ -224,6 +250,9 @@ pub struct PrefetchGetObject<Stream: ObjectPartStream, Client: ObjectClient> {
     next_request_size: usize,
     next_request_offset: u64,
     size: u64,
+    parsed_metadata: ParsedMetadata,
+    raw_metadata: RawMetadata,
+    should_parse_metadata: bool,
 }
 
 #[async_trait]
@@ -284,7 +313,52 @@ where
             bucket: bucket.to_owned(),
             object_id: ObjectId::new(key.to_owned(), etag),
             size,
+            parsed_metadata: Default::default(),
+            raw_metadata: Default::default(),
+            should_parse_metadata: true,
         }
+    }
+
+    /// Ensures that the Parquet metadata is loaded, parsing and caching it if not already done.
+    async fn ensure_parquet_metadata_loaded(&self) -> Result<(), PrefetchReadError<Client::ClientError>> {
+        if self.parsed_metadata.read().await.is_some() {
+            return Ok(());
+        }
+
+        let mut metadata_write = self.parsed_metadata.write().await;
+        if metadata_write.is_none() {
+            let metadata = self.load_parquet_metadata().await?;
+            *metadata_write = Some(metadata);
+        }
+        drop(metadata_write);
+
+        trace!("Metadata For Reference: {:?}", &self.parsed_metadata);
+        trace!("Raw Metadata For Reference: {:?}", &self.raw_metadata);
+
+        Ok(())
+    }
+
+    /// Loads the Parquet metadata from the object store and stores it as a tree.
+    async fn load_parquet_metadata(
+        &self,
+    ) -> Result<IntervalTree<u64, (usize, usize)>, PrefetchReadError<Client::ClientError>> {
+        let (raw_metadata, metadata_range) = read_parquet_metadata(
+            self.client.clone(),
+            &self.bucket,
+            self.object_id.key(),
+            self.object_id.etag(),
+            self.size,
+        )
+        .await?;
+
+        let metadata_len = raw_metadata.len() - 8;
+        let metadata = decode_metadata(&raw_metadata[..metadata_len])
+            .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
+
+        let mut raw_metadata_write = self.raw_metadata.write().await;
+        *raw_metadata_write = Some((raw_metadata, metadata_range));
+
+        Ok(parse_byte_ranges_tree(&metadata))
     }
 
     async fn try_read(
@@ -292,6 +366,25 @@ where
         offset: u64,
         length: usize,
     ) -> Result<ChecksummedBytes, PrefetchReadError<Client::ClientError>> {
+        // Initially check if file is a parquet file
+        if self.object_id.key().ends_with(".parquet") && self.should_parse_metadata {
+            match self.ensure_parquet_metadata_loaded().await {
+                Ok(_) => {
+                    trace!("Parquet file detected, parsing metadata");
+                    let interval_tree = self.parsed_metadata.read().await;
+                    if let Some(interval_tree) = interval_tree.as_ref() {
+                        let row_groups_and_columns =
+                            get_row_groups_and_columns(interval_tree, offset, offset + length as u64);
+                        trace!("Row groups and columns: {:?}", row_groups_and_columns);
+                        // TODO: Now we got this, use the row_groups_and_columns information to optimise reads
+                    }
+                }
+                Err(_) => {
+                    self.should_parse_metadata = false;
+                }
+            }
+        }
+
         // Currently, we set preferred part size to the current read size.
         // Our assumption is that the read size will be the same for most sequential
         // read and it can be aligned to the size of prefetched chunks.
