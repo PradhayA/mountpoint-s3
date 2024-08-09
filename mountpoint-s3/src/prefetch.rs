@@ -9,19 +9,18 @@
 
 mod caching_stream;
 mod parquet_prefetch;
+mod parquet_stream;
 mod part;
 mod part_queue;
 mod part_stream;
 mod seek_window;
 mod task;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
-use std::ops::Range;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures::task::Spawn;
 use intervaltree::IntervalTree;
 use metrics::{counter, histogram};
@@ -29,7 +28,8 @@ use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
 use parquet::file::footer::decode_metadata;
-use parquet_prefetch::{get_row_groups_and_columns, parse_byte_ranges_tree, read_parquet_metadata};
+use parquet_prefetch::{parse_byte_ranges_tree, read_parquet_metadata};
+use parquet_stream::ParquetPartStream;
 use thiserror::Error;
 use tracing::trace;
 
@@ -41,7 +41,9 @@ use crate::prefetch::part_stream::{ClientPartStream, ObjectPartStream, RequestRa
 use crate::prefetch::seek_window::SeekWindow;
 use crate::prefetch::task::RequestTask;
 use crate::sync::Arc;
+
 pub use async_lock::RwLock as AsyncRwLock;
+pub use parquet_prefetch::{ColumnIndex, InMemoryCache, ParsedMetadata, RawMetadata, RowGroupIndex};
 
 /// Generic interface to handle reading data from an object.
 pub trait Prefetch {
@@ -102,14 +104,16 @@ where
     Prefetcher::new(part_stream, prefetcher_config)
 }
 
-pub type ParquetPrefetcher<Runtime> = Prefetcher<ClientPartStream<Runtime>>;
+pub type ParquetPrefetcher<Runtime> = Prefetcher<ParquetPartStream<Runtime>>;
+pub type MetadataRef = Arc<AsyncRwLock<Option<ParsedMetadata>>>;
+pub type RawMetadataRef = Arc<AsyncRwLock<Option<RawMetadata>>>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
 pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
 where
     Runtime: Spawn + Send + Sync + 'static,
 {
-    let part_stream = ClientPartStream::new(runtime);
+    let part_stream = ParquetPartStream::new(runtime);
     Prefetcher::new(part_stream, prefetcher_config)
 }
 
@@ -220,11 +224,6 @@ where
     }
 }
 
-type ParsedMetadata = Arc<AsyncRwLock<Option<IntervalTree<u64, (RowGroupIndex, ColumnIndex)>>>>;
-type RawMetadata = Arc<AsyncRwLock<Option<(Bytes, Range<u64>)>>>;
-type RowGroupIndex = usize;
-type ColumnIndex = usize;
-
 /// A GetObject request that divides the desired range of the object into chunks that it prefetches
 /// in a way that maximizes throughput from S3.
 #[derive(Debug)]
@@ -250,9 +249,10 @@ pub struct PrefetchGetObject<Stream: ObjectPartStream, Client: ObjectClient> {
     next_request_size: usize,
     next_request_offset: u64,
     size: u64,
-    parsed_metadata: ParsedMetadata,
-    raw_metadata: RawMetadata,
+    parsed_metadata: MetadataRef,
+    raw_metadata: RawMetadataRef,
     should_parse_metadata: bool,
+    data_cache: InMemoryCache,
 }
 
 #[async_trait]
@@ -316,6 +316,7 @@ where
             parsed_metadata: Default::default(),
             raw_metadata: Default::default(),
             should_parse_metadata: true,
+            data_cache: Default::default(),
         }
     }
 
@@ -325,15 +326,16 @@ where
             return Ok(());
         }
 
+        let mut rowgroup_col_cache = self.data_cache.write().await;
+        *rowgroup_col_cache = Some(HashMap::new());
+        drop(rowgroup_col_cache);
+
         let mut metadata_write = self.parsed_metadata.write().await;
         if metadata_write.is_none() {
             let metadata = self.load_parquet_metadata().await?;
             *metadata_write = Some(metadata);
         }
         drop(metadata_write);
-
-        trace!("Metadata For Reference: {:?}", &self.parsed_metadata);
-        trace!("Raw Metadata For Reference: {:?}", &self.raw_metadata);
 
         Ok(())
     }
@@ -356,7 +358,10 @@ where
             .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
 
         let mut raw_metadata_write = self.raw_metadata.write().await;
-        *raw_metadata_write = Some((raw_metadata, metadata_range));
+        *raw_metadata_write = Some(RawMetadata {
+            bytes: ChecksummedBytes::new(raw_metadata),
+            range: metadata_range,
+        });
 
         Ok(parse_byte_ranges_tree(&metadata))
     }
@@ -370,17 +375,11 @@ where
         if self.object_id.key().ends_with(".parquet") && self.should_parse_metadata {
             match self.ensure_parquet_metadata_loaded().await {
                 Ok(_) => {
-                    trace!("Parquet file detected, parsing metadata");
-                    let interval_tree = self.parsed_metadata.read().await;
-                    if let Some(interval_tree) = interval_tree.as_ref() {
-                        let row_groups_and_columns =
-                            get_row_groups_and_columns(interval_tree, offset, offset + length as u64);
-                        trace!("Row groups and columns: {:?}", row_groups_and_columns);
-                        // TODO: Now we got this, use the row_groups_and_columns information to optimise reads
-                    }
+                    trace!("Parquet file detected, getting metadata");
                 }
                 Err(_) => {
                     self.should_parse_metadata = false;
+                    tracing::warn!("Metadata parsing failed, falling back to default behaviour");
                 }
             }
         }
@@ -498,6 +497,9 @@ where
             self.object_id.etag().clone(),
             range,
             self.preferred_part_size,
+            self.data_cache.clone(),
+            self.parsed_metadata.clone(),
+            self.raw_metadata.clone(),
         );
 
         // [read] will reset these if the reader stops making sequential requests

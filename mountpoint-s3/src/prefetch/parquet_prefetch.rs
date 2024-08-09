@@ -1,4 +1,7 @@
-use crate::sync::Arc;
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+
 use bytes::{Bytes, BytesMut};
 use futures::pin_mut;
 use futures::StreamExt;
@@ -8,29 +11,88 @@ use mountpoint_s3_client::ObjectClient;
 use parquet::errors::ParquetError;
 use parquet::file::footer::decode_footer;
 use parquet::file::metadata::ParquetMetaData;
+use std::ops::Range;
 use tracing::trace;
 
 use super::PrefetchReadError;
+use crate::checksums::ChecksummedBytes;
+use crate::sync::Arc;
+
+pub use async_lock::RwLock as AsyncRwLock;
 
 const PARQUET_MAGIC_LEN: usize = 8;
 
+/// Range Wrapper for sorting
+/// Ranges are considered equal if both start and end points match exactly
+/// This is used to sort ranges in the interval tree
+/// Primary comparison on start, secondary on end
+#[derive(Debug, Clone)]
+pub struct RangeKey {
+    pub range: Range<u64>,
+}
+
+impl PartialEq for RangeKey {
+    fn eq(&self, other: &Self) -> bool {
+        // Ranges are equal only if both start and end points match exactly
+        self.range.start == other.range.start && self.range.end == other.range.end
+    }
+}
+
+impl Eq for RangeKey {}
+
+#[allow(clippy::non_canonical_partial_ord_impl)]
+impl PartialOrd for RangeKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        // Primary comparison on start, secondary on end
+        if self.range.start == other.range.start {
+            Some(self.range.end.cmp(&other.range.end))
+        } else {
+            Some(self.range.start.cmp(&other.range.start))
+        }
+    }
+}
+
+impl Ord for RangeKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+pub type ParsedMetadata = IntervalTree<u64, (RowGroupIndex, ColumnIndex)>;
+pub type RowGroupIndex = usize;
+pub type ColumnIndex = usize;
+
+#[derive(Debug)]
+pub struct RawMetadata {
+    pub bytes: ChecksummedBytes,
+    pub range: Range<u64>,
+}
+
+pub type InMemoryCache =
+    Arc<AsyncRwLock<Option<HashMap<(RowGroupIndex, ColumnIndex), BTreeMap<RangeKey, ChecksummedBytes>>>>>;
+
+/// Read Parquet metadata using the given S3 client,
+/// returning the raw bytes and the byte range containing the footer.
 pub async fn read_parquet_metadata<Client>(
     client: Arc<Client>,
     bucket: &str,
     key: &str,
     if_match: &ETag,
-    total_size: u64,
+    object_size: u64,
 ) -> Result<(Bytes, std::ops::Range<u64>), PrefetchReadError<Client::ClientError>>
 where
     Client: ObjectClient + Send + Sync + 'static,
 {
-    fetch_metadata(client, bucket, key, if_match, total_size)
+    fetch_metadata(client, bucket, key, if_match, object_size)
         .await
         .map(|(metadata, footer, metadata_range)| {
             let mut combined = BytesMut::with_capacity(metadata.len() + PARQUET_MAGIC_LEN);
             combined.extend_from_slice(&metadata);
             combined.extend_from_slice(&footer);
-            (combined.freeze(), metadata_range)
+            (
+                combined.freeze(),
+                metadata_range.start..(metadata_range.end + PARQUET_MAGIC_LEN as u64),
+            )
         })
         .map_err(|_| PrefetchReadError::MetadataParsingFailed)
 }
@@ -40,19 +102,21 @@ async fn fetch_metadata<Client>(
     bucket: &str,
     key: &str,
     if_match: &ETag,
-    total_size: u64,
+    object_size: u64,
 ) -> Result<(Bytes, [u8; PARQUET_MAGIC_LEN], std::ops::Range<u64>), ParquetError>
 where
     Client: ObjectClient + Send + Sync + 'static,
 {
-    if total_size < PARQUET_MAGIC_LEN as u64 {
+    if object_size < PARQUET_MAGIC_LEN as u64 {
         return Err(ParquetError::General(
             "Invalid Parquet file. Size is smaller than footer".to_string(),
         ));
     }
 
+    // We refer to the last 8 bytes of a Parquet file as the footer.
+    // This is sometimes described differently in different Parquet implementations.
     let mut footer = [0_u8; PARQUET_MAGIC_LEN];
-    let footer_range = (total_size - PARQUET_MAGIC_LEN as u64)..total_size;
+    let footer_range = (object_size - PARQUET_MAGIC_LEN as u64)..object_size;
 
     fetch_object_part(&client, bucket, key, if_match, footer_range.clone(), |body| {
         footer.copy_from_slice(&body[..PARQUET_MAGIC_LEN])
@@ -60,20 +124,20 @@ where
     .await?;
 
     let metadata_len = decode_footer(&footer)?;
-    let footer_metadata_len = PARQUET_MAGIC_LEN + metadata_len;
+    let file_metadata_len = PARQUET_MAGIC_LEN + metadata_len;
 
-    if footer_metadata_len > total_size as usize {
+    if file_metadata_len > object_size as usize {
         return Err(ParquetError::General(
             "Invalid Parquet file. Reported metadata length is shorter than expected".to_string(),
         ));
     }
 
-    let metadata_start = total_size - footer_metadata_len as u64;
-    let metadata_range = metadata_start..total_size;
+    let metadata_start = object_size - file_metadata_len as u64;
+    let metadata_range = metadata_start..object_size - PARQUET_MAGIC_LEN as u64;
 
-    let mut metadata = BytesMut::new();
+    let mut metadata = BytesMut::with_capacity(metadata_len);
     fetch_object_part(&client, bucket, key, if_match, metadata_range.clone(), |body| {
-        metadata.extend_from_slice(&body)
+        metadata.extend_from_slice(body)
     })
     .await?;
 
@@ -113,12 +177,13 @@ where
     Ok(())
 }
 
-pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (usize, usize)> {
-    // Stored as an interval tree, where the key is the start and end byte of the column chunk, and the value is the rowgroup and column index
-    // This allows us to efficiently find the column chunk for a given byte offset
-    // The value is stored as a tuple of (rowgroup_index, column_index) to allow for easy retrieval of the column metadata
-    // Overall, this approach has a time complexity of O(n log n) for constructing the tree, and O(log n) for lookup, resulting in an efficient solution for finding the column chunk for a given byte offset
-
+/// Parse metadata to build a mapping from between byte offsets and the row group and column it belongs to.
+///
+/// Stored as an interval tree, where the key is the start and end byte of the column chunk, and the value is the rowgroup and column index
+/// This allows us to efficiently find the column chunk for a given byte offset
+/// The value is stored as a tuple of (rowgroup_index, column_index) to allow for easy retrieval of the column metadata
+/// Overall, this approach has a time complexity of O(n log n) for constructing the tree, and O(log n) for lookup, resulting in an efficient solution for finding the column chunk for a given byte offset
+pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (RowGroupIndex, ColumnIndex)> {
     let elements = metadata
         .row_groups()
         .iter()
@@ -130,26 +195,11 @@ pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (
                 .enumerate()
                 .map(move |(column_index, column_metadata)| {
                     let start_byte = column_metadata.file_offset() as u64;
-                    let end_byte = start_byte + column_metadata.compressed_size() as u64 - 1;
+                    let end_byte = start_byte + column_metadata.compressed_size() as u64;
                     (start_byte..end_byte, (rowgroup_index, column_index))
                 })
         })
         .collect::<Vec<_>>();
 
     IntervalTree::from_iter(elements)
-}
-
-pub fn get_row_groups_and_columns(
-    interval_tree: &IntervalTree<u64, (usize, usize)>,
-    start_byte: u64,
-    end_byte: u64,
-) -> Vec<((usize, usize), (u64, u64))> {
-    interval_tree
-        .query(start_byte..end_byte)
-        .map(|element| {
-            let intersection_start = start_byte.max(element.range.start);
-            let intersection_end = end_byte.min(element.range.end);
-            (element.value, (intersection_start, intersection_end))
-        })
-        .collect()
 }
