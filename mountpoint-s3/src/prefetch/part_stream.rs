@@ -179,7 +179,7 @@ where
         if_match: ETag,
         range: RequestRange,
         preferred_part_size: usize,
-        in_mem_cache: InMemoryCache,
+        _in_mem_cache: InMemoryCache,
         _parsed_metadata: MetadataRef,
         _raw_metadata: RawMetadataRef,
     ) -> RequestTask<Client::ClientError>

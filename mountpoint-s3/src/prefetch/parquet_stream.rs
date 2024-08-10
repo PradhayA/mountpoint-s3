@@ -84,6 +84,13 @@ where
                     }
                 }
 
+                let mut rowgroup_cols: Vec<((RowGroupIndex, ColumnIndex), Range<u64>)> =
+                    if let Some(metadata) = &metadata {
+                        get_row_groups_and_columns(metadata, remaining_range.clone())
+                    } else {
+                        Vec::new()
+                    };
+
                 while !remaining_range.is_empty() {
                     if !try_serve_from_cache(
                         &mut remaining_range,
@@ -91,6 +98,7 @@ where
                         &in_mem_cache,
                         &id,
                         &part_queue_producer,
+                        &rowgroup_cols,
                     )
                     .await
                     {
@@ -101,7 +109,7 @@ where
                             &mut remaining_range,
                             preferred_part_size,
                             &in_mem_cache,
-                            &metadata,
+                            &mut rowgroup_cols,
                             &part_queue_producer,
                         )
                         .await
@@ -139,12 +147,12 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     in_mem_cache: &InMemoryCache,
     id: &ObjectId,
     part_queue_producer: &crate::prefetch::part_queue::PartQueueProducer<E>,
+    cols: &Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>,
 ) -> bool {
-    if let Some(metadata) = metadata {
-        let row_group_cols = get_row_groups_and_columns(metadata, remaining_range.clone());
+    if metadata.is_some() {
         let mut rowgroup_col_cache = in_mem_cache.write().await;
 
-        for (row_group_col, col_range) in &row_group_cols {
+        for (row_group_col, col_range) in cols {
             if let Some(col_cache) = rowgroup_col_cache
                 .as_mut()
                 .and_then(|cache| cache.get_mut(row_group_col))
@@ -157,7 +165,7 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
                 );
 
                 for cached_range in &cached_ranges {
-                    if cached_range.range.start > col_range.end {
+                    if cached_range.range.start >= col_range.end {
                         break;
                     }
 
@@ -197,7 +205,7 @@ async fn fetch_from_client<Client>(
     remaining_range: &mut Range<u64>,
     preferred_part_size: usize,
     in_mem_cache: &InMemoryCache,
-    metadata: &Option<IntervalTree<u64, (RowGroupIndex, ColumnIndex)>>,
+    cols: &mut Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>,
     part_queue_producer: &PartQueueProducer<Client::ClientError>,
 ) -> Result<(), PrefetchReadError<Client::ClientError>>
 where
@@ -223,20 +231,18 @@ where
                     *rowgroup_col_cache = Some(HashMap::new());
                 }
 
-                if let Some(metadata) = metadata {
-                    let cols = get_row_groups_and_columns(metadata, part_range.clone());
-                    for (row_group_col, _) in cols {
-                        let col_cache = rowgroup_col_cache
-                            .as_mut()
-                            .unwrap()
-                            .entry(row_group_col)
-                            .or_insert_with(BTreeMap::new);
+                let split_index: usize = cols.partition_point(|(_, col_range)| col_range.start < part_range.end);
+                cols.truncate(split_index);
 
-                        if let Err(e) =
-                            merge_ranges(col_cache, part_range.clone(), part.get_check_summed_bytes().clone())
-                        {
-                            error!("Error merging ranges: {:?}", e);
-                        }
+                for ((row_group, column), _) in cols.iter() {
+                    let col_cache = rowgroup_col_cache
+                        .as_mut()
+                        .unwrap()
+                        .entry((*row_group, *column))
+                        .or_insert_with(BTreeMap::new);
+
+                    if let Err(e) = merge_ranges(col_cache, part_range.clone(), part.get_check_summed_bytes().clone()) {
+                        error!("Error merging ranges: {:?}", e);
                     }
                 }
 
@@ -274,7 +280,8 @@ async fn serve_metadata<E: std::error::Error + Send + Sync + 'static>(
             let metadata_end = (metadata_range.end - metadata_start_end.start) as usize;
             let metadata_bytes = raw_metadata.slice(metadata_start..metadata_end);
             trace!("Metadata range start-end: {:?}-{:?}", metadata_start, metadata_end);
-            part_queue_producer.push(Ok(Part::new(id.clone(), metadata_range.start, metadata_bytes)));
+            let metadata_part = Part::new(id.clone(), metadata_range.start, metadata_bytes);
+            part_queue_producer.push(Ok(metadata_part));
         }
     }
 }
