@@ -147,45 +147,44 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     in_mem_cache: &InMemoryCache,
     id: &ObjectId,
     part_queue_producer: &crate::prefetch::part_queue::PartQueueProducer<E>,
-    cols: &Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>,
+    rowgroup_cols: &Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>,
 ) -> bool {
     if metadata.is_some() {
-        let mut rowgroup_col_cache = in_mem_cache.write().await;
+        let rowgroup_col_cache = in_mem_cache.read().await;
 
-        for (row_group_col, col_range) in cols {
-            if let Some(col_cache) = rowgroup_col_cache
-                .as_mut()
-                .and_then(|cache| cache.get_mut(row_group_col))
-            {
-                let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
-                trace!(
-                    "For row group col {:?}, Cached ranges: {:?}",
-                    row_group_col,
-                    cached_ranges
-                );
+        if let Some(cache) = &*rowgroup_col_cache {
+            for (row_group_col, col_range) in rowgroup_cols {
+                if let Some(col_cache) = cache.get(row_group_col) {
+                    let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
+                    trace!(
+                        "For row group col {:?}, Cached ranges: {:?}",
+                        row_group_col,
+                        cached_ranges
+                    );
 
-                for cached_range in &cached_ranges {
-                    if cached_range.range.start >= col_range.end {
-                        break;
-                    }
+                    for cached_range in &cached_ranges {
+                        if cached_range.range.start >= col_range.end {
+                            break;
+                        }
 
-                    if let Some(intersection) = intersect_ranges(&cached_range.range, remaining_range) {
-                        let data = col_cache.get(cached_range).unwrap();
-                        let part_start = intersection.start;
-                        let part_end = intersection.end;
-                        let data_offset = part_start - cached_range.range.start;
+                        if let Some(intersection) = intersect_ranges(&cached_range.range, remaining_range) {
+                            let data = col_cache.get(cached_range).unwrap();
+                            let part_start = intersection.start;
+                            let part_end = intersection.end;
+                            let data_offset = part_start - cached_range.range.start;
 
-                        if part_start == remaining_range.start {
-                            let part_data =
-                                data.slice(data_offset as usize..(data_offset + (part_end - part_start)) as usize);
-                            let part = Part::new(id.clone(), part_start, part_data);
+                            if part_start == remaining_range.start {
+                                let part_data =
+                                    data.slice(data_offset as usize..(data_offset + (part_end - part_start)) as usize);
+                                let part = Part::new(id.clone(), part_start, part_data);
 
-                            trace!("Pushing part to queue from cache: {:?}", part_start..part_end);
-                            part_queue_producer.push(Ok(part));
+                                trace!("Pushing part to queue from cache: {:?}", part_start..part_end);
+                                part_queue_producer.push(Ok(part));
 
-                            *remaining_range = part_end..remaining_range.end;
-                            if remaining_range.is_empty() {
-                                return true;
+                                *remaining_range = part_end..remaining_range.end;
+                                if remaining_range.is_empty() {
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -193,6 +192,7 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
             }
         }
     }
+
     false
 }
 
