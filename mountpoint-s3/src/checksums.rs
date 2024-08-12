@@ -32,10 +32,6 @@ impl ChecksummedBytes {
         }
     }
 
-    pub fn range(&self) -> Range<usize> {
-        self.range.clone()
-    }
-
     /// Create [ChecksummedBytes] from [Bytes], calculating its checksum.
     pub fn new(bytes: Bytes) -> Self {
         let checksum = crc32c::checksum(&bytes);

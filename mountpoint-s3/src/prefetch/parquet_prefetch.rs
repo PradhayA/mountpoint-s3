@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::ops::Deref;
 
 use bytes::{Bytes, BytesMut};
 use futures::pin_mut;
@@ -22,39 +23,45 @@ pub use async_lock::RwLock as AsyncRwLock;
 
 const PARQUET_MAGIC_LEN: usize = 8;
 
-/// Range Wrapper for sorting
-/// Ranges are considered equal if both start and end points match exactly
-/// This is used to sort ranges in the interval tree
-/// Primary comparison on start, secondary on end
+/// Wrapper to allow sorting of [Range<u64>].
+///
+/// Range does not implement [Ord] as there is no generic meaning,
+/// however we need it to implement [Ord] to be used in the interval tree.
+/// This type considers ranges to be ordered by first comparing the start of the range, then falling back to the end of the range if equal.
 #[derive(Debug, Clone)]
-pub struct RangeKey {
-    pub range: Range<u64>,
+pub struct RangeKey(pub Range<u64>);
+
+impl Deref for RangeKey {
+    type Target = Range<u64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl PartialEq for RangeKey {
     fn eq(&self, other: &Self) -> bool {
         // Ranges are equal only if both start and end points match exactly
-        self.range.start == other.range.start && self.range.end == other.range.end
+        self.start == other.start && self.end == other.end
     }
 }
 
 impl Eq for RangeKey {}
 
-#[allow(clippy::non_canonical_partial_ord_impl)]
-impl PartialOrd for RangeKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+impl Ord for RangeKey {
+    fn cmp(&self, other: &Self) -> Ordering {
         // Primary comparison on start, secondary on end
-        if self.range.start == other.range.start {
-            Some(self.range.end.cmp(&other.range.end))
+        if self.start == other.start {
+            self.end.cmp(&other.end)
         } else {
-            Some(self.range.start.cmp(&other.range.start))
+            self.start.cmp(&other.start)
         }
     }
 }
 
-impl Ord for RangeKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
+impl PartialOrd for RangeKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 

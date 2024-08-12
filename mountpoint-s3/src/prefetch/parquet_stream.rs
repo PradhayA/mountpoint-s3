@@ -19,11 +19,8 @@ use crate::prefetch::task::RequestTask;
 use crate::prefetch::InMemoryCache;
 use crate::prefetch::{PrefetchReadError, RawMetadata};
 
-use super::parquet_prefetch::RangeKey;
+use super::parquet_prefetch::{ColumnIndex, RangeKey, RowGroupIndex};
 use super::{MetadataRef, RawMetadataRef};
-
-type RowGroupIndex = usize;
-type ColumnIndex = usize;
 
 #[derive(Debug)]
 pub struct ParquetPartStream<Runtime> {
@@ -68,7 +65,6 @@ where
             let span = debug_span!("prefetch", range=?range);
 
             async move {
-                let metadata = parsed_metadata.read().await.clone();
                 let request_range = range.start()..range.end();
 
                 let mut remaining_range = request_range.clone();
@@ -84,6 +80,7 @@ where
                     }
                 }
 
+                let metadata = parsed_metadata.read().await.clone();
                 let mut rowgroup_cols: Vec<((RowGroupIndex, ColumnIndex), Range<u64>)> =
                     if let Some(metadata) = &metadata {
                         get_row_groups_and_columns(metadata, remaining_range.clone())
@@ -92,7 +89,7 @@ where
                     };
 
                 while !remaining_range.is_empty() {
-                    if !try_serve_from_cache(
+                    let cache_read_success = try_serve_from_cache(
                         &mut remaining_range,
                         &metadata,
                         &in_mem_cache,
@@ -100,8 +97,8 @@ where
                         &part_queue_producer,
                         &rowgroup_cols,
                     )
-                    .await
-                    {
+                    .await;
+                    if !cache_read_success {
                         if let Err(e) = fetch_from_client(
                             &client,
                             &bucket,
@@ -149,42 +146,43 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     part_queue_producer: &crate::prefetch::part_queue::PartQueueProducer<E>,
     rowgroup_cols: &Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>,
 ) -> bool {
-    if metadata.is_some() {
-        let rowgroup_col_cache = in_mem_cache.read().await;
+    if metadata.is_none() {
+        return false;
+    }
 
-        if let Some(cache) = &*rowgroup_col_cache {
-            for (row_group_col, col_range) in rowgroup_cols {
-                if let Some(col_cache) = cache.get(row_group_col) {
-                    let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
-                    trace!(
-                        "For row group col {:?}, Cached ranges: {:?}",
-                        row_group_col,
-                        cached_ranges
-                    );
+    let rowgroup_col_cache = in_mem_cache.read().await;
+    if let Some(cache) = &*rowgroup_col_cache {
+        for (row_group_col, col_range) in rowgroup_cols {
+            if let Some(col_cache) = cache.get(row_group_col) {
+                let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
+                trace!(
+                    "For row group col {:?}, Cached ranges: {:?}",
+                    row_group_col,
+                    cached_ranges
+                );
 
-                    for cached_range in &cached_ranges {
-                        if cached_range.range.start >= col_range.end {
-                            break;
-                        }
+                for cached_range in &cached_ranges {
+                    if cached_range.start >= col_range.end {
+                        break;
+                    }
 
-                        if let Some(intersection) = intersect_ranges(&cached_range.range, remaining_range) {
-                            let data = col_cache.get(cached_range).unwrap();
-                            let part_start = intersection.start;
-                            let part_end = intersection.end;
-                            let data_offset = part_start - cached_range.range.start;
+                    if let Some(intersection) = intersect_ranges(&cached_range, remaining_range) {
+                        let data = col_cache.get(cached_range).unwrap();
+                        let part_start = intersection.start;
+                        let part_end = intersection.end;
+                        let data_offset = part_start - cached_range.start;
 
-                            if part_start == remaining_range.start {
-                                let part_data =
-                                    data.slice(data_offset as usize..(data_offset + (part_end - part_start)) as usize);
-                                let part = Part::new(id.clone(), part_start, part_data);
+                        if part_start == remaining_range.start {
+                            let part_data =
+                                data.slice(data_offset as usize..(data_offset + (part_end - part_start)) as usize);
+                            let part = Part::new(id.clone(), part_start, part_data);
 
-                                trace!("Pushing part to queue from cache: {:?}", part_start..part_end);
-                                part_queue_producer.push(Ok(part));
+                            trace!("Pushing part to queue from cache: {:?}", part_start..part_end);
+                            part_queue_producer.push(Ok(part));
 
-                                *remaining_range = part_end..remaining_range.end;
-                                if remaining_range.is_empty() {
-                                    return true;
-                                }
+                            *remaining_range = part_end..remaining_range.end;
+                            if remaining_range.is_empty() {
+                                return true;
                             }
                         }
                     }
@@ -221,15 +219,12 @@ where
     match get_from_client(client, bucket, id, prefetch_range).await {
         Ok(parts) => {
             let mut rowgroup_col_cache = in_mem_cache.write().await;
+            rowgroup_col_cache.get_or_insert_with(HashMap::new);
 
             for part in parts {
                 let part_range = part.offset()..part.offset() + part.len() as u64;
                 trace!("Pushing part to queue from client: {:?}", part_range);
                 part_queue_producer.push(Ok(part.clone()));
-
-                if rowgroup_col_cache.is_none() {
-                    *rowgroup_col_cache = Some(HashMap::new());
-                }
 
                 let split_index: usize = cols.partition_point(|(_, col_range)| col_range.start < part_range.end);
                 cols.truncate(split_index);
@@ -241,7 +236,7 @@ where
                         .entry((*row_group, *column))
                         .or_insert_with(BTreeMap::new);
 
-                    if let Err(e) = merge_ranges(col_cache, part_range.clone(), part.get_check_summed_bytes().clone()) {
+                    if let Err(e) = merge_ranges(col_cache, part_range.clone(), part.get_checksummed_bytes().clone()) {
                         error!("Error merging ranges: {:?}", e);
                     }
                 }
@@ -273,11 +268,11 @@ async fn serve_metadata<E: std::error::Error + Send + Sync + 'static>(
         let raw_metadata_lock = raw_metadata.read().await;
         if let Some(RawMetadata {
             bytes: raw_metadata,
-            range: metadata_start_end,
+            range: raw_metadata_range,
         }) = &*raw_metadata_lock
         {
-            let metadata_start = (metadata_range.start - metadata_start_end.start) as usize;
-            let metadata_end = (metadata_range.end - metadata_start_end.start) as usize;
+            let metadata_start = (metadata_range.start - raw_metadata_range.start) as usize;
+            let metadata_end = (metadata_range.end - raw_metadata_range.start) as usize;
             let metadata_bytes = raw_metadata.slice(metadata_start..metadata_end);
             trace!("Metadata range start-end: {:?}-{:?}", metadata_start, metadata_end);
             let metadata_part = Part::new(id.clone(), metadata_range.start, metadata_bytes);
@@ -380,14 +375,14 @@ fn merge_ranges(
     let mut merged_data = new_data;
 
     for (existing_range, existing_data) in col_cache.iter() {
-        if merged_range.start <= existing_range.range.end && merged_range.end >= existing_range.range.start {
-            let merged_start = merged_range.start.min(existing_range.range.start);
-            let merged_end = merged_range.end.max(existing_range.range.end);
+        if merged_range.start <= existing_range.end && merged_range.end >= existing_range.start {
+            let merged_start = merged_range.start.min(existing_range.start);
+            let merged_end = merged_range.end.max(existing_range.end);
 
             let mut new_merged_data = ChecksummedBytes::default();
 
             if merged_start < merged_range.start {
-                let prefix = existing_data.slice(0..(merged_range.start - existing_range.range.start) as usize);
+                let prefix = existing_data.slice(0..(merged_range.start - existing_range.start) as usize);
                 new_merged_data.extend(prefix)?;
             }
 
@@ -396,7 +391,7 @@ fn merge_ranges(
             new_merged_data.extend(merged_data.slice(new_data_start..new_data_end))?;
 
             if merged_end > merged_range.end {
-                let suffix = existing_data.slice((merged_range.end - existing_range.range.start) as usize..);
+                let suffix = existing_data.slice((merged_range.end - existing_range.start) as usize..);
                 new_merged_data.extend(suffix)?;
             }
 
@@ -410,7 +405,7 @@ fn merge_ranges(
         col_cache.remove(range);
     }
 
-    col_cache.insert(RangeKey { range: merged_range }, merged_data);
+    col_cache.insert(RangeKey(merged_range), merged_data);
 
     Ok(())
 }

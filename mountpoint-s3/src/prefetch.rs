@@ -373,9 +373,10 @@ where
     ) -> Result<ChecksummedBytes, PrefetchReadError<Client::ClientError>> {
         // Initially check if file is a parquet file
         if self.object_id.key().ends_with(".parquet") && self.should_parse_metadata {
+            trace!("Parquet file detected, getting metadata");
             match self.ensure_parquet_metadata_loaded().await {
                 Ok(_) => {
-                    trace!("Parquet file detected, getting metadata");
+                    trace!("Parquet file metadata successfully loaded");
                 }
                 Err(_) => {
                     self.should_parse_metadata = false;
