@@ -8,6 +8,7 @@
 //! non-sequential read, we abandon the prefetching and start again with the minimum request size.
 
 mod caching_stream;
+mod lru_cache;
 mod parquet_prefetch;
 mod parquet_stream;
 mod part;
@@ -18,9 +19,11 @@ mod task;
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
+use std::ops::Range;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use futures::task::Spawn;
 use intervaltree::IntervalTree;
 use metrics::{counter, histogram};
@@ -105,8 +108,9 @@ where
 }
 
 pub type ParquetPrefetcher<Runtime> = Prefetcher<ParquetPartStream<Runtime>>;
-pub type MetadataRef = Arc<AsyncRwLock<Option<ParsedMetadata>>>;
+pub type MetadataRef = Arc<AsyncRwLock<Option<(ParsedMetadata, HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>)>>>;
 pub type RawMetadataRef = Arc<AsyncRwLock<Option<RawMetadata>>>;
+type CachedRef = Arc<DashMap<ObjectId, (RawMetadataRef, MetadataRef, InMemoryCache)>>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
 pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
@@ -182,6 +186,7 @@ impl Default for PrefetcherConfig {
 pub struct Prefetcher<Stream> {
     part_stream: Arc<Stream>,
     config: PrefetcherConfig,
+    metadata_cache: CachedRef,
 }
 
 impl<Stream> Prefetcher<Stream>
@@ -191,7 +196,12 @@ where
     /// Create a new [Prefetcher] from the given [ObjectPartStream] instance.
     pub fn new(part_stream: Stream, config: PrefetcherConfig) -> Self {
         let part_stream = Arc::new(part_stream);
-        Self { part_stream, config }
+        let metadata_cache: CachedRef = Arc::new(DashMap::new());
+        Self {
+            part_stream,
+            config,
+            metadata_cache,
+        }
     }
 }
 
@@ -220,6 +230,7 @@ where
             key,
             size,
             etag,
+            self.metadata_cache.clone(),
         )
     }
 }
@@ -297,7 +308,23 @@ where
         key: &str,
         size: u64,
         etag: ETag,
+        metadata_cache: CachedRef,
     ) -> Self {
+        let metadata_entry = metadata_cache
+            .entry(ObjectId::new(key.to_owned(), etag.clone()))
+            .or_insert_with(|| {
+                (
+                    Arc::new(AsyncRwLock::new(None)),
+                    Arc::new(AsyncRwLock::new(None)),
+                    Arc::new(AsyncRwLock::new(None)),
+                )
+            });
+
+        let raw_metadata = metadata_entry.value().0.clone();
+        let parsed_metadata = metadata_entry.value().1.clone();
+        trace!("Metadata that exists here {:?}", parsed_metadata);
+        let data_cache = metadata_entry.value().2.clone();
+
         PrefetchGetObject {
             client,
             part_stream,
@@ -313,10 +340,10 @@ where
             bucket: bucket.to_owned(),
             object_id: ObjectId::new(key.to_owned(), etag),
             size,
-            parsed_metadata: Default::default(),
-            raw_metadata: Default::default(),
+            parsed_metadata,
+            raw_metadata,
             should_parse_metadata: true,
-            data_cache: Default::default(),
+            data_cache,
         }
     }
 
@@ -325,10 +352,6 @@ where
         if self.parsed_metadata.read().await.is_some() {
             return Ok(());
         }
-
-        let mut rowgroup_col_cache = self.data_cache.write().await;
-        *rowgroup_col_cache = Some(HashMap::new());
-        drop(rowgroup_col_cache);
 
         let mut metadata_write = self.parsed_metadata.write().await;
         if metadata_write.is_none() {
@@ -343,7 +366,13 @@ where
     /// Loads the Parquet metadata from the object store and stores it as a tree.
     async fn load_parquet_metadata(
         &self,
-    ) -> Result<IntervalTree<u64, (usize, usize)>, PrefetchReadError<Client::ClientError>> {
+    ) -> Result<
+        (
+            IntervalTree<u64, (usize, usize)>,
+            HashMap<(usize, usize), std::ops::Range<u64>>,
+        ),
+        PrefetchReadError<Client::ClientError>,
+    > {
         let (raw_metadata, metadata_range) = read_parquet_metadata(
             self.client.clone(),
             &self.bucket,
@@ -362,6 +391,10 @@ where
             bytes: ChecksummedBytes::new(raw_metadata),
             range: metadata_range,
         });
+
+        // let mut data_cache_write = self.data_cache.write().await;
+        // *data_cache_write = Some(HashMap::new());
+        trace!("I had to come in here for file {:?}!!!", self.object_id.key());
 
         Ok(parse_byte_ranges_tree(&metadata))
     }

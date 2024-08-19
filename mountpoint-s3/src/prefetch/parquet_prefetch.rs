@@ -15,6 +15,7 @@ use parquet::file::metadata::ParquetMetaData;
 use std::ops::Range;
 use tracing::trace;
 
+use super::lru_cache::LruCache;
 use super::PrefetchReadError;
 use crate::checksums::ChecksummedBytes;
 use crate::sync::Arc;
@@ -75,8 +76,14 @@ pub struct RawMetadata {
     pub range: Range<u64>,
 }
 
-pub type InMemoryCache =
-    Arc<AsyncRwLock<Option<HashMap<(RowGroupIndex, ColumnIndex), BTreeMap<RangeKey, ChecksummedBytes>>>>>;
+pub type InMemoryCache = Arc<
+    AsyncRwLock<
+        Option<(
+            HashMap<(RowGroupIndex, ColumnIndex), BTreeMap<RangeKey, ChecksummedBytes>>,
+            LruCache,
+        )>,
+    >,
+>; // Note: Put locks on the inside rather than the outside to allow concurrenta access to the InMemoryCache
 
 /// Read Parquet metadata using the given S3 client,
 /// returning the raw bytes and the byte range containing the footer.
@@ -190,23 +197,24 @@ where
 /// This allows us to efficiently find the column chunk for a given byte offset
 /// The value is stored as a tuple of (rowgroup_index, column_index) to allow for easy retrieval of the column metadata
 /// Overall, this approach has a time complexity of O(n log n) for constructing the tree, and O(log n) for lookup, resulting in an efficient solution for finding the column chunk for a given byte offset
-pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> IntervalTree<u64, (RowGroupIndex, ColumnIndex)> {
-    let elements = metadata
-        .row_groups()
-        .iter()
-        .enumerate()
-        .flat_map(|(rowgroup_index, rowgroup)| {
-            rowgroup
-                .columns()
-                .iter()
-                .enumerate()
-                .map(move |(column_index, column_metadata)| {
-                    let start_byte = column_metadata.file_offset() as u64;
-                    let end_byte = start_byte + column_metadata.compressed_size() as u64;
-                    (start_byte..end_byte, (rowgroup_index, column_index))
-                })
-        })
-        .collect::<Vec<_>>();
+pub fn parse_byte_ranges_tree(
+    metadata: &ParquetMetaData,
+) -> (
+    IntervalTree<u64, (RowGroupIndex, ColumnIndex)>,
+    HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>,
+) {
+    let mut elements = Vec::new();
+    let mut rowgroup_col_ranges = HashMap::new();
 
-    IntervalTree::from_iter(elements)
+    for (rowgroup_index, rowgroup) in metadata.row_groups().iter().enumerate() {
+        for (column_index, column_metadata) in rowgroup.columns().iter().enumerate() {
+            let start_byte = column_metadata.file_offset() as u64;
+            let end_byte = start_byte + column_metadata.compressed_size() as u64;
+            elements.push((start_byte..end_byte, (rowgroup_index, column_index)));
+            rowgroup_col_ranges.insert((rowgroup_index, column_index), start_byte..end_byte);
+        }
+    }
+
+    let interval_tree = IntervalTree::from_iter(elements);
+    (interval_tree, rowgroup_col_ranges)
 }
