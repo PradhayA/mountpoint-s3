@@ -80,7 +80,7 @@ pub type InMemoryCache = Arc<
     AsyncRwLock<
         Option<(
             HashMap<(RowGroupIndex, ColumnIndex), BTreeMap<RangeKey, ChecksummedBytes>>,
-            LruCache,
+            AsyncRwLock<LruCache>,
         )>,
     >,
 >; // Note: Put locks on the inside rather than the outside to allow concurrenta access to the InMemoryCache

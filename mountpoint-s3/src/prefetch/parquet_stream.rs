@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::time::Instant;
 
+pub use async_lock::RwLock as AsyncRwLock;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::task::{Spawn, SpawnExt};
@@ -256,25 +257,14 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
         return false;
     }
 
-    let mut cache_guard = in_mem_cache.read().await;
+    let cache_guard = in_mem_cache.read().await;
     if let Some((ref cache, ref lru_cache)) = *cache_guard {
         for (row_group_col, col_range) in rowgroup_cols {
             if let Some(col_cache) = cache.get(row_group_col) {
-                // Note: ignore for now - used for LRU cache eviction
-
-                // let key = CacheKey {
-                //     file_id: id.key().to_string(),
-                //     row_group: row_group_col.0,
-                //     column: row_group_col.1,
-                // };
-
-                // if lru_cache.touch_entry(&key) {
-                //     trace!("Cache hit for {:?}", key);
-                // } else {
-                //     warn!("Cache miss for {:?}", key);
-                // }
-
                 let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
+                if !cached_ranges.is_empty() {
+                    move_entry_to_back(id, row_group_col, lru_cache).await; // Still move entry to back since this (rowgroup, col) is accessed
+                }
                 for cached_range in &cached_ranges {
                     if cached_range.start >= col_range.end {
                         return false;
@@ -310,6 +300,18 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     false
 }
 
+/// Moves entry (row group, col) to the back of LRU entry cache
+async fn move_entry_to_back(id: &ObjectId, row_group_col: &(usize, usize), lru_cache: &AsyncRwLock<LruCache>) {
+    let key = CacheKey {
+        file_id: id.key().to_string(),
+        row_group: row_group_col.0,
+        column: row_group_col.1,
+    };
+    let mut lru_cache_guard = lru_cache.write().await;
+    lru_cache_guard.touch_entry(&key);
+    drop(lru_cache_guard);
+}
+
 /// Fetches the requested range from the client
 #[allow(clippy::too_many_arguments)]
 async fn fetch_from_client<Client>(
@@ -340,7 +342,7 @@ where
         Ok(parts) => {
             let mut cache_guard = in_mem_cache.write().await;
             let (cache, lru_cache) = cache_guard.get_or_insert_with(|| {
-                (HashMap::new(), LruCache::new(1000 * 1024 * 1024)) // 1 GB limit
+                (HashMap::new(), AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024))) // 1 GB limit
             });
 
             for part in parts {
@@ -360,7 +362,6 @@ where
                 part_queue_producer.push(Ok(part.clone()));
 
                 // Filters out columns so we need to walk through less columns on the next part (next round) leveraging non-overlapping, structured order
-                let original = cols.clone();
                 let mut new_cols = Vec::new();
                 let mut remaining_cols = Vec::new();
 
@@ -392,6 +393,8 @@ where
                     ) {
                         warn!("Error merging ranges: {:?}", e);
                     }
+
+                    lru_record(id, row_group_col, &part, lru_cache, cache).await;
                 }
 
                 *remaining_range = part_range.end..remaining_range.end;
@@ -407,6 +410,25 @@ where
     }
 
     Ok(())
+}
+
+/// Records entry (rowg roup, col) into LRU entry cache and evict (row group, cols) if necessary
+async fn lru_record(id: &ObjectId, row_group_col: (usize, usize), part: &Part, lru_cache: &mut AsyncRwLock<LruCache>, cache: &mut HashMap<(usize, usize), BTreeMap<RangeKey, ChecksummedBytes>>) {
+    let key = CacheKey {
+        file_id: id.key().to_string(),
+        row_group: row_group_col.0,
+        column: row_group_col.1,
+    };
+
+    let size = part.len();
+    let mut lru_cache_guard = lru_cache.write().await;
+    let evicted = lru_cache_guard.add_entry(key, size);
+    for evicted_key in evicted {
+        if let Some(evicted_col_cache) = cache.get_mut(&(evicted_key.row_group, evicted_key.column)) {
+            evicted_col_cache.clear();
+        }
+    }
+    drop(lru_cache_guard);
 }
 
 /// Get from client as requested
