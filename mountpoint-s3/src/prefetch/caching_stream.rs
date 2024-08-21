@@ -16,7 +16,7 @@ use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
 use crate::prefetch::PrefetchReadError;
 
-use super::{InMemoryCache, MetadataRef, RawMetadataRef};
+use super::{InMemoryCacheRef, MetadataRef, RawMetadataRef};
 
 /// [ObjectPartStream] implementation which maintains a [DataCache] for the object data
 /// retrieved by an [ObjectClient].
@@ -48,7 +48,7 @@ where
         if_match: ETag,
         range: RequestRange,
         _preferred_part_size: usize,
-        _in_memory_cache: InMemoryCache,
+        _in_memory_cache: InMemoryCacheRef,
         _parsed_metadata: MetadataRef,
         _raw_metadata: RawMetadataRef,
     ) -> RequestTask<<Client as ObjectClient>::ClientError>
@@ -330,7 +330,7 @@ mod tests {
 
     use crate::{
         data_cache::InMemoryDataCache,
-        prefetch::{InMemoryCache, RawMetadataRef},
+        prefetch::{InMemoryCacheRef, RawMetadataRef},
     };
 
     use super::*;
@@ -382,7 +382,7 @@ mod tests {
                 etag.clone(),
                 range,
                 0,
-                InMemoryCache::default(),
+                InMemoryCacheRef::default(),
                 MetadataRef::default(),
                 RawMetadataRef::default(),
             );
@@ -401,7 +401,7 @@ mod tests {
                 etag.clone(),
                 range,
                 0,
-                InMemoryCache::default(),
+                InMemoryCacheRef::default(),
                 MetadataRef::default(),
                 RawMetadataRef::default(),
             );
@@ -446,7 +446,7 @@ mod tests {
                     etag.clone(),
                     range,
                     0,
-                    InMemoryCache::default(),
+                    InMemoryCacheRef::default(),
                     MetadataRef::default(),
                     RawMetadataRef::default(),
                 );

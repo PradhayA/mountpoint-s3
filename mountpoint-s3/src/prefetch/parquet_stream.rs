@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::task::{Spawn, SpawnExt};
 use futures::{pin_mut, StreamExt};
-use intervaltree::IntervalTree;
 use mountpoint_s3_client::{types::ETag, ObjectClient};
 use tracing::{debug_span, error, trace, warn, Instrument};
 
@@ -19,11 +18,13 @@ use crate::prefetch::part_queue::unbounded_part_queue;
 use crate::prefetch::part_queue::PartQueueProducer;
 use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
-use crate::prefetch::InMemoryCache;
-use crate::prefetch::{PrefetchReadError, RawMetadata};
+use crate::prefetch::InMemoryCacheRef;
+use crate::prefetch::PrefetchReadError;
 
-use super::parquet_prefetch::{ColumnIndex, RangeKey, RowGroupIndex};
-use super::{MetadataRef, RawMetadataRef};
+use super::parquet_prefetch::{CachedRanges, ColumnIndex, InMemoryCache, LruCacheRef, RangeKey, RowGroupIndex};
+use super::{MetadataRef, ParsedMetadata, RawMetadataRef, RowgroupColRanges};
+
+type RowgroupCols = Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>;
 
 #[derive(Debug)]
 pub struct ParquetPartStream<Runtime> {
@@ -50,7 +51,7 @@ where
         if_match: ETag,
         range: RequestRange,
         preferred_part_size: usize,
-        in_mem_cache: InMemoryCache,
+        in_mem_cache: InMemoryCacheRef,
         parsed_metadata: MetadataRef,
         raw_metadata: RawMetadataRef,
     ) -> RequestTask<Client::ClientError>
@@ -103,12 +104,11 @@ where
                     }
 
                     let metadata = parsed_metadata.read().await.clone();
-                    let mut rowgroup_cols: Vec<((RowGroupIndex, ColumnIndex), Range<u64>)> =
-                        if let Some(metadata) = &metadata {
-                            get_row_groups_and_columns(&metadata.0, remaining_range.clone())
-                        } else {
-                            Vec::new()
-                        };
+                    let mut rowgroup_cols: RowgroupCols = if let Some(metadata) = &metadata {
+                        get_row_groups_and_columns(&metadata.0, remaining_range.clone())
+                    } else {
+                        Vec::new()
+                    };
 
                     while !remaining_range.is_empty() {
                         let start = Instant::now();
@@ -126,7 +126,7 @@ where
                         hist.record(start.elapsed().as_micros() as f64);
 
                         if !cache_read_success {
-                            let size = remaining_range.end - remaining_range.start;
+                            let size = remaining_range.end - remaining_range.start; // or let size = preferred_part_size; (needs more research)
                             if let Err(e) = fetch_from_client(
                                 &client,
                                 &bucket,
@@ -244,14 +244,11 @@ async fn spawn_default_get_object_request<Client>(
 /// Tries to serve data from cache as much as possible
 async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     remaining_range: &mut Range<u64>,
-    metadata: &Option<(
-        IntervalTree<u64, (RowGroupIndex, ColumnIndex)>,
-        HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>,
-    )>,
-    in_mem_cache: &InMemoryCache,
+    metadata: &Option<(ParsedMetadata, RowgroupColRanges)>,
+    in_mem_cache: &InMemoryCacheRef,
     id: &ObjectId,
     part_queue_producer: &crate::prefetch::part_queue::PartQueueProducer<E>,
-    rowgroup_cols: &Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>,
+    rowgroup_cols: &RowgroupCols,
 ) -> bool {
     if metadata.is_none() {
         return false;
@@ -320,13 +317,10 @@ async fn fetch_from_client<Client>(
     id: &ObjectId,
     remaining_range: &mut Range<u64>,
     preferred_part_size: usize,
-    in_mem_cache: &InMemoryCache,
-    cols: &mut Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>,
+    in_mem_cache: &InMemoryCacheRef,
+    cols: &mut RowgroupCols,
     part_queue_producer: &PartQueueProducer<Client::ClientError>,
-    metadata: &Option<(
-        IntervalTree<u64, (RowGroupIndex, ColumnIndex)>,
-        HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>,
-    )>,
+    metadata: &Option<(ParsedMetadata, RowgroupColRanges)>,
 ) -> Result<(), PrefetchReadError<Client::ClientError>>
 where
     Client: ObjectClient + Send + Sync + 'static,
@@ -342,7 +336,8 @@ where
         Ok(parts) => {
             let mut cache_guard = in_mem_cache.write().await;
             let (cache, lru_cache) = cache_guard.get_or_insert_with(|| {
-                (HashMap::new(), AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024))) // 1 GB limit
+                (HashMap::new(), AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)))
+                // 1 GB limit
             });
 
             for part in parts {
@@ -378,7 +373,7 @@ where
 
                 *cols = remaining_cols;
 
-                for (row_group_col, col_range) in new_cols {
+                for (row_group_col, _col_range) in new_cols {
                     let col_cache = cache.entry(row_group_col).or_insert_with(BTreeMap::new);
                     if let Err(e) = merge_ranges(
                         col_cache,
@@ -413,7 +408,13 @@ where
 }
 
 /// Records entry (rowg roup, col) into LRU entry cache and evict (row group, cols) if necessary
-async fn lru_record(id: &ObjectId, row_group_col: (usize, usize), part: &Part, lru_cache: &mut AsyncRwLock<LruCache>, cache: &mut HashMap<(usize, usize), BTreeMap<RangeKey, ChecksummedBytes>>) {
+async fn lru_record(
+    id: &ObjectId,
+    row_group_col: (usize, usize),
+    part: &Part,
+    lru_cache: &mut LruCacheRef,
+    cache: &mut InMemoryCache,
+) {
     let key = CacheKey {
         file_id: id.key().to_string(),
         row_group: row_group_col.0,
@@ -499,10 +500,7 @@ where
 /// Get row groups and columns that intersect with the given range
 ///
 /// Returns a vector of tuples containing the row group and column index, and the intersecting range
-fn get_row_groups_and_columns(
-    interval_tree: &IntervalTree<u64, (RowGroupIndex, ColumnIndex)>,
-    range: Range<u64>,
-) -> Vec<((RowGroupIndex, ColumnIndex), Range<u64>)> {
+fn get_row_groups_and_columns(interval_tree: &ParsedMetadata, range: Range<u64>) -> RowgroupCols {
     interval_tree
         .iter_sorted()
         .filter_map(|element| {
@@ -521,7 +519,7 @@ fn get_row_groups_and_columns(
 
 /// Inserts and merges ranges to ensure non overlapping and structured order in the cache
 fn merge_ranges(
-    col_cache: &mut BTreeMap<RangeKey, ChecksummedBytes>,
+    col_cache: &mut CachedRanges,
     new_range: Range<u64>,
     new_data: ChecksummedBytes,
     col_range: &Range<u64>,

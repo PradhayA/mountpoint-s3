@@ -13,7 +13,7 @@ use crate::prefetch::part_queue::unbounded_part_queue;
 use crate::prefetch::task::RequestTask;
 use crate::prefetch::PrefetchReadError;
 
-use super::InMemoryCache;
+use super::InMemoryCacheRef;
 use super::{MetadataRef, RawMetadataRef};
 
 /// A generic interface to retrieve data from objects in a S3-like store.
@@ -30,13 +30,13 @@ pub trait ObjectPartStream {
         if_match: ETag,
         range: RequestRange,
         preferred_part_size: usize,
-        in_mem_cache: InMemoryCache,
+        in_mem_cache: InMemoryCacheRef,
         parsed_metadata: MetadataRef,
         raw_metadata: RawMetadataRef,
     ) -> RequestTask<Client::ClientError>
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
-        InMemoryCache: Default + Send + Sync + 'static;
+        InMemoryCacheRef: Default + Send + Sync + 'static;
 }
 
 /// The range of a [ObjectPartStream::spawn_get_object_request] request.
@@ -179,7 +179,7 @@ where
         if_match: ETag,
         range: RequestRange,
         preferred_part_size: usize,
-        _in_mem_cache: InMemoryCache,
+        _in_mem_cache: InMemoryCacheRef,
         _parsed_metadata: MetadataRef,
         _raw_metadata: RawMetadataRef,
     ) -> RequestTask<Client::ClientError>

@@ -76,14 +76,11 @@ pub struct RawMetadata {
     pub range: Range<u64>,
 }
 
-pub type InMemoryCache = Arc<
-    AsyncRwLock<
-        Option<(
-            HashMap<(RowGroupIndex, ColumnIndex), BTreeMap<RangeKey, ChecksummedBytes>>,
-            AsyncRwLock<LruCache>,
-        )>,
-    >,
->; // Note: Put locks on the inside rather than the outside to allow concurrenta access to the InMemoryCache
+pub type CachedRanges = BTreeMap<RangeKey, ChecksummedBytes>;
+pub type InMemoryCache = HashMap<(RowGroupIndex, ColumnIndex), CachedRanges>;
+pub type LruCacheRef = AsyncRwLock<LruCache>;
+
+pub type InMemoryCacheRef = Arc<AsyncRwLock<Option<(InMemoryCache, LruCacheRef)>>>;
 
 /// Read Parquet metadata using the given S3 client,
 /// returning the raw bytes and the byte range containing the footer.

@@ -237,16 +237,13 @@ mod tests {
         cache.add_entry(key2.clone(), 40);
         cache.add_entry(key3.clone(), 20);
 
-        // Check the initial order
         let keys: Vec<_> = cache.entries.keys().cloned().collect();
         assert_eq!(keys, vec![key1.clone(), key2.clone(), key3.clone()]);
 
-        // Touch key1, it should move to the back
         cache.touch_entry(&key1);
         let keys: Vec<_> = cache.entries.keys().cloned().collect();
         assert_eq!(keys, vec![key2.clone(), key3.clone(), key1.clone()]);
 
-        // Touch key3, it should move to the back
         cache.touch_entry(&key3);
         let keys: Vec<_> = cache.entries.keys().cloned().collect();
         assert_eq!(keys, vec![key2, key1, key3]);

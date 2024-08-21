@@ -46,7 +46,7 @@ use crate::prefetch::task::RequestTask;
 use crate::sync::Arc;
 
 pub use async_lock::RwLock as AsyncRwLock;
-pub use parquet_prefetch::{ColumnIndex, InMemoryCache, ParsedMetadata, RawMetadata, RowGroupIndex};
+pub use parquet_prefetch::{ColumnIndex, InMemoryCacheRef, ParsedMetadata, RawMetadata, RowGroupIndex};
 
 /// Generic interface to handle reading data from an object.
 pub trait Prefetch {
@@ -108,9 +108,10 @@ where
 }
 
 pub type ParquetPrefetcher<Runtime> = Prefetcher<ParquetPartStream<Runtime>>;
-pub type MetadataRef = Arc<AsyncRwLock<Option<(ParsedMetadata, HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>)>>>;
+pub type RowgroupColRanges = HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>;
+pub type MetadataRef = Arc<AsyncRwLock<Option<(ParsedMetadata, RowgroupColRanges)>>>;
 pub type RawMetadataRef = Arc<AsyncRwLock<Option<RawMetadata>>>;
-type CachedRef = Arc<DashMap<ObjectId, (RawMetadataRef, MetadataRef, InMemoryCache)>>;
+type CachedRef = Arc<DashMap<ObjectId, (RawMetadataRef, MetadataRef, InMemoryCacheRef)>>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
 pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
@@ -263,7 +264,7 @@ pub struct PrefetchGetObject<Stream: ObjectPartStream, Client: ObjectClient> {
     parsed_metadata: MetadataRef,
     raw_metadata: RawMetadataRef,
     should_parse_metadata: bool,
-    data_cache: InMemoryCache,
+    data_cache: InMemoryCacheRef,
 }
 
 #[async_trait]
