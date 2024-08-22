@@ -14,12 +14,10 @@ use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::object::ObjectId;
 use crate::prefetch::lru_cache::{CacheKey, LruCache};
 use crate::prefetch::part::Part;
-use crate::prefetch::part_queue::unbounded_part_queue;
-use crate::prefetch::part_queue::PartQueueProducer;
+use crate::prefetch::part_queue::{unbounded_part_queue, PartQueueProducer};
 use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
-use crate::prefetch::InMemoryCacheRef;
-use crate::prefetch::PrefetchReadError;
+use crate::prefetch::{InMemoryCacheRef, PrefetchReadError};
 
 use super::parquet_prefetch::{CachedRanges, ColumnIndex, InMemoryCache, LruCacheRef, RangeKey, RowGroupIndex};
 use super::{MetadataRef, ParsedMetadata, RawMetadataRef, RowgroupColRanges};
@@ -247,7 +245,7 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     metadata: &Option<(ParsedMetadata, RowgroupColRanges)>,
     in_mem_cache: &InMemoryCacheRef,
     id: &ObjectId,
-    part_queue_producer: &crate::prefetch::part_queue::PartQueueProducer<E>,
+    part_queue_producer: &PartQueueProducer<E>,
     rowgroup_cols: &RowgroupCols,
 ) -> bool {
     if metadata.is_none() {
@@ -304,9 +302,10 @@ async fn move_entry_to_back(id: &ObjectId, row_group_col: &(usize, usize), lru_c
         row_group: row_group_col.0,
         column: row_group_col.1,
     };
-    let mut lru_cache_guard = lru_cache.write().await;
-    lru_cache_guard.touch_entry(&key);
-    drop(lru_cache_guard);
+    {
+        let mut lru_cache_guard = lru_cache.write().await;
+        lru_cache_guard.touch_entry(&key);
+    }
 }
 
 /// Fetches the requested range from the client
@@ -422,14 +421,15 @@ async fn lru_record(
     };
 
     let size = part.len();
-    let mut lru_cache_guard = lru_cache.write().await;
-    let evicted = lru_cache_guard.add_entry(key, size);
-    for evicted_key in evicted {
-        if let Some(evicted_col_cache) = cache.get_mut(&(evicted_key.row_group, evicted_key.column)) {
-            evicted_col_cache.clear();
+    {
+        let mut lru_cache_guard = lru_cache.write().await;
+        let evicted = lru_cache_guard.add_entry(key, size);
+        for evicted_key in evicted {
+            if let Some(evicted_col_cache) = cache.get_mut(&(evicted_key.row_group, evicted_key.column)) {
+                evicted_col_cache.clear();
+            }
         }
     }
-    drop(lru_cache_guard);
 }
 
 /// Get from client as requested

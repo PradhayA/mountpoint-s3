@@ -354,12 +354,13 @@ where
             return Ok(());
         }
 
-        let mut metadata_write = self.parsed_metadata.write().await;
-        if metadata_write.is_none() {
-            let metadata = self.load_parquet_metadata().await?;
-            *metadata_write = Some(metadata);
+        {
+            let mut metadata_write = self.parsed_metadata.write().await;
+            if metadata_write.is_none() {
+                let metadata = self.load_parquet_metadata().await?;
+                *metadata_write = Some(metadata);
+            }
         }
-        drop(metadata_write);
 
         Ok(())
     }
