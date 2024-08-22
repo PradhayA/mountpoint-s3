@@ -375,7 +375,7 @@ where
         ),
         PrefetchReadError<Client::ClientError>,
     > {
-        let (raw_metadata, metadata_range) = read_parquet_metadata(
+        let (raw_metadata, raw_metadata_range, metadata_start) = read_parquet_metadata(
             self.client.clone(),
             &self.bucket,
             self.object_id.key(),
@@ -385,15 +385,17 @@ where
         .await?;
 
         let metadata_len = raw_metadata.len() - 8;
-        let metadata = decode_metadata(&raw_metadata[..metadata_len])
+        let metadata_area = metadata_start - raw_metadata_range.start;
+
+        let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
             .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
 
         let mut raw_metadata_write = self.raw_metadata.write().await;
         *raw_metadata_write = Some(RawMetadata {
             bytes: ChecksummedBytes::new(raw_metadata),
-            range: metadata_range,
+            range: raw_metadata_range,
         });
-        
+
         Ok(parse_byte_ranges_tree(&metadata))
     }
 

@@ -22,7 +22,7 @@ use crate::sync::Arc;
 
 pub use async_lock::RwLock as AsyncRwLock;
 
-const PARQUET_MAGIC_LEN: usize = 8;
+const METADATA_READ_SIZE: u64 = 8192; // Estimate of max metadata footer size
 
 /// Wrapper to allow sorting of [Range<u64>].
 ///
@@ -90,83 +90,72 @@ pub async fn read_parquet_metadata<Client>(
     key: &str,
     if_match: &ETag,
     object_size: u64,
-) -> Result<(Bytes, std::ops::Range<u64>), PrefetchReadError<Client::ClientError>>
+) -> Result<(Bytes, std::ops::Range<u64>, u64), PrefetchReadError<Client::ClientError>>
 where
     Client: ObjectClient + Send + Sync + 'static,
 {
-    fetch_metadata(client, bucket, key, if_match, object_size)
-        .await
-        .map(|(metadata, footer, metadata_range)| {
-            let mut combined = BytesMut::with_capacity(metadata.len() + PARQUET_MAGIC_LEN);
-            combined.extend_from_slice(&metadata);
-            combined.extend_from_slice(&footer);
-            (
-                combined.freeze(),
-                metadata_range.start..(metadata_range.end + PARQUET_MAGIC_LEN as u64),
-            )
-        })
-        .map_err(|_| PrefetchReadError::MetadataParsingFailed)
+    let read_size = METADATA_READ_SIZE.min(object_size);
+    let raw_metadata_range_end = object_size;
+    let raw_metadata_range_start = raw_metadata_range_end.saturating_sub(read_size);
+    let raw_metadata = match fetch_object_part(
+        &client,
+        bucket,
+        key,
+        if_match,
+        raw_metadata_range_start..raw_metadata_range_end,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => return Err(PrefetchReadError::MetadataParsingFailed),
+    };
+
+    let metadata_len = {
+        let footer_bytes: [u8; 8] = raw_metadata[raw_metadata.len() - 8..]
+            .try_into()
+            .map_err(|_| PrefetchReadError::MetadataParsingFailed)?;
+        decode_footer(&footer_bytes).map_err(|_| PrefetchReadError::MetadataParsingFailed)?
+    };
+
+    let metadata_start = object_size - metadata_len as u64 - 8;
+    if metadata_start < raw_metadata_range_start {
+        // Metadata is partially outside the read range, read the remaining bytes
+        let remaining_metadata =
+            match fetch_object_part(&client, bucket, key, if_match, metadata_start..raw_metadata_range_start).await {
+                Ok(bytes) => bytes,
+                Err(_) => return Err(PrefetchReadError::MetadataParsingFailed),
+            };
+
+        let total_metadata_len = remaining_metadata.len() + raw_metadata.len();
+        let mut raw_metadata_bytes = BytesMut::with_capacity(total_metadata_len);
+        raw_metadata_bytes.extend_from_slice(&remaining_metadata[..]);
+        raw_metadata_bytes.extend_from_slice(&raw_metadata);
+        Ok((
+            raw_metadata_bytes.freeze(),
+            metadata_start..raw_metadata_range_end,
+            metadata_start,
+        ))
+    } else {
+        Ok((
+            raw_metadata,
+            raw_metadata_range_start..raw_metadata_range_end,
+            metadata_start,
+        ))
+    }
 }
 
-async fn fetch_metadata<Client>(
-    client: Arc<Client>,
-    bucket: &str,
-    key: &str,
-    if_match: &ETag,
-    object_size: u64,
-) -> Result<(Bytes, [u8; PARQUET_MAGIC_LEN], std::ops::Range<u64>), ParquetError>
-where
-    Client: ObjectClient + Send + Sync + 'static,
-{
-    if object_size < PARQUET_MAGIC_LEN as u64 {
-        return Err(ParquetError::General(
-            "Invalid Parquet file. Size is smaller than footer".to_string(),
-        ));
-    }
-
-    // We refer to the last 8 bytes of a Parquet file as the footer.
-    // This is sometimes described differently in different Parquet implementations.
-    let mut footer = [0_u8; PARQUET_MAGIC_LEN];
-    let footer_range = (object_size - PARQUET_MAGIC_LEN as u64)..object_size;
-
-    fetch_object_part(&client, bucket, key, if_match, footer_range.clone(), |body| {
-        footer.copy_from_slice(&body[..PARQUET_MAGIC_LEN])
-    })
-    .await?;
-
-    let metadata_len = decode_footer(&footer)?;
-    let file_metadata_len = PARQUET_MAGIC_LEN + metadata_len;
-
-    if file_metadata_len > object_size as usize {
-        return Err(ParquetError::General(
-            "Invalid Parquet file. Reported metadata length is shorter than expected".to_string(),
-        ));
-    }
-
-    let metadata_start = object_size - file_metadata_len as u64;
-    let metadata_range = metadata_start..object_size - PARQUET_MAGIC_LEN as u64;
-
-    let mut metadata = BytesMut::with_capacity(metadata_len);
-    fetch_object_part(&client, bucket, key, if_match, metadata_range.clone(), |body| {
-        metadata.extend_from_slice(body)
-    })
-    .await?;
-
-    Ok((metadata.freeze(), footer, metadata_range))
-}
-
-async fn fetch_object_part<Client, F>(
+async fn fetch_object_part<Client>(
     client: &Arc<Client>,
     bucket: &str,
     key: &str,
     if_match: &ETag,
     range: std::ops::Range<u64>,
-    mut handle_body: F,
-) -> Result<(), ParquetError>
+) -> Result<Bytes, ParquetError>
 where
     Client: ObjectClient + Send + Sync + 'static,
-    F: FnMut(&[u8]),
 {
+    let mut body = BytesMut::new();
+
     let get_object_result = client
         .get_object(bucket, key, Some(range), Some(if_match.clone()))
         .await
@@ -176,16 +165,16 @@ where
 
     while let Some(result) = get_object_result.next().await {
         match result {
-            Ok((_, body)) => {
-                trace!(length = body.len(), "received part");
-                metrics::counter!("s3.client.total_bytes", "type" => "read").increment(body.len() as u64);
-                handle_body(&body);
+            Ok((_, bytes)) => {
+                trace!(length = bytes.len(), "received part");
+                metrics::counter!("s3.client.total_bytes", "type" => "read").increment(bytes.len() as u64);
+                body.extend_from_slice(&bytes);
             }
             Err(e) => return Err(ParquetError::General(format!("Error fetching object part: {}", e))),
         }
     }
 
-    Ok(())
+    Ok(body.freeze())
 }
 
 /// Parse metadata to build a mapping from between byte offsets and the row group and column it belongs to.
