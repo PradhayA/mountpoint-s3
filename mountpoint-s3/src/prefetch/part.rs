@@ -21,6 +21,14 @@ impl Part {
         }
     }
 
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    pub fn get_checksummed_bytes(&self) -> &ChecksummedBytes {
+        &self.checksummed_bytes
+    }
+
     pub fn into_bytes(self, id: &ObjectId, offset: u64) -> Result<ChecksummedBytes, PartMismatchError> {
         self.check(id, offset).map(|_| self.checksummed_bytes)
     }

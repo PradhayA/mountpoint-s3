@@ -31,7 +31,8 @@ use crate::fs::{CacheConfig, S3FilesystemConfig, ServerSideEncryption, TimeToLiv
 use crate::fuse::session::FuseSession;
 use crate::fuse::S3FuseFilesystem;
 use crate::logging::{init_logging, LoggingConfig};
-use crate::prefetch::{caching_prefetch, default_prefetch, Prefetch};
+#[allow(unused_imports)] // TEMPORARY FOR TESTING
+use crate::prefetch::{caching_prefetch, default_prefetch, parquet_prefetch, Prefetch};
 use crate::prefix::Prefix;
 use crate::s3::S3Personality;
 use crate::{autoconfigure, metrics};
@@ -758,7 +759,8 @@ where
         }
     }
 
-    let prefetcher = default_prefetch(runtime, prefetcher_config);
+    // let prefetcher = default_prefetch(runtime, prefetcher_config); // Just for testing purposes (will make it a parameter to pass)
+    let prefetcher = parquet_prefetch(runtime, prefetcher_config);
     create_filesystem(
         client,
         prefetcher,
