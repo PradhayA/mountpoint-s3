@@ -393,11 +393,7 @@ where
             bytes: ChecksummedBytes::new(raw_metadata),
             range: metadata_range,
         });
-
-        // let mut data_cache_write = self.data_cache.write().await;
-        // *data_cache_write = Some(HashMap::new());
-        trace!("I had to come in here for file {:?}!!!", self.object_id.key());
-
+        
         Ok(parse_byte_ranges_tree(&metadata))
     }
 
