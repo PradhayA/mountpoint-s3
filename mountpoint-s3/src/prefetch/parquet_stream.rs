@@ -20,7 +20,7 @@ use crate::prefetch::task::RequestTask;
 use crate::prefetch::{InMemoryCacheRef, PrefetchReadError};
 
 use super::parquet_prefetch::{CachedRanges, ColumnIndex, InMemoryCache, LruCacheRef, RangeKey, RowGroupIndex};
-use super::{MetadataRef, ParsedMetadata, RawMetadataRef, RowgroupColRanges};
+use super::{CacheEntry, ParsedMetadata, RowgroupColRanges};
 
 type RowgroupCols = Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>;
 
@@ -49,13 +49,15 @@ where
         if_match: ETag,
         range: RequestRange,
         preferred_part_size: usize,
-        in_mem_cache: InMemoryCacheRef,
-        parsed_metadata: MetadataRef,
-        raw_metadata: RawMetadataRef,
+        cached_structure: CacheEntry,
     ) -> RequestTask<Client::ClientError>
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
     {
+        let raw_metadata = cached_structure.0.clone();
+        let parsed_metadata = cached_structure.1.clone();
+        let in_mem_cache = cached_structure.2.clone();
+
         let start = range.start();
         let size = range.len();
         let (part_queue, part_queue_producer) = unbounded_part_queue();
@@ -265,7 +267,7 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
                         return false;
                     } // Return early since no point going forward from here
 
-                    if let Some(intersection) = intersect_ranges(&cached_range, remaining_range) {
+                    if let Some(intersection) = intersect_ranges(cached_range, remaining_range) {
                         let data = col_cache.get(cached_range).unwrap();
                         let part_start = intersection.start;
                         let part_end = intersection.end;
@@ -378,7 +380,7 @@ where
                         col_cache,
                         part_range.clone(),
                         part.get_checksummed_bytes().clone(),
-                        &metadata
+                        metadata
                             .as_ref()
                             .unwrap()
                             .1

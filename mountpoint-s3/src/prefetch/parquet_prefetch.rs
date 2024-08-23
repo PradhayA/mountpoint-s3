@@ -17,6 +17,7 @@ use tracing::trace;
 
 use super::lru_cache::LruCache;
 use super::PrefetchReadError;
+use super::RowgroupColRanges;
 use crate::checksums::ChecksummedBytes;
 use crate::sync::Arc;
 
@@ -183,12 +184,7 @@ where
 /// This allows us to efficiently find the column chunk for a given byte offset
 /// The value is stored as a tuple of (rowgroup_index, column_index) to allow for easy retrieval of the column metadata
 /// Overall, this approach has a time complexity of O(n log n) for constructing the tree, and O(log n) for lookup, resulting in an efficient solution for finding the column chunk for a given byte offset
-pub fn parse_byte_ranges_tree(
-    metadata: &ParquetMetaData,
-) -> (
-    IntervalTree<u64, (RowGroupIndex, ColumnIndex)>,
-    HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>,
-) {
+pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> (ParsedMetadata, RowgroupColRanges) {
     let mut elements = Vec::new();
     let mut rowgroup_col_ranges = HashMap::new();
 

@@ -111,7 +111,8 @@ pub type ParquetPrefetcher<Runtime> = Prefetcher<ParquetPartStream<Runtime>>;
 pub type RowgroupColRanges = HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>;
 pub type MetadataRef = Arc<AsyncRwLock<Option<(ParsedMetadata, RowgroupColRanges)>>>;
 pub type RawMetadataRef = Arc<AsyncRwLock<Option<RawMetadata>>>;
-type CachedRef = Arc<DashMap<ObjectId, (RawMetadataRef, MetadataRef, InMemoryCacheRef)>>;
+pub type CacheEntry = (RawMetadataRef, MetadataRef, InMemoryCacheRef);
+type CachedRef = Arc<DashMap<ObjectId, CacheEntry>>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
 pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
@@ -261,10 +262,8 @@ pub struct PrefetchGetObject<Stream: ObjectPartStream, Client: ObjectClient> {
     next_request_size: usize,
     next_request_offset: u64,
     size: u64,
-    parsed_metadata: MetadataRef,
-    raw_metadata: RawMetadataRef,
     should_parse_metadata: bool,
-    data_cache: InMemoryCacheRef,
+    cached_entry: CacheEntry,
 }
 
 #[async_trait]
@@ -301,6 +300,7 @@ where
     Client: ObjectClient + Send + Sync + 'static,
 {
     /// Create and spawn a new prefetching request for an object
+    #[allow(clippy::too_many_arguments)]
     fn new(
         client: Arc<Client>,
         part_stream: Arc<Stream>,
@@ -323,7 +323,6 @@ where
 
         let raw_metadata = metadata_entry.value().0.clone();
         let parsed_metadata = metadata_entry.value().1.clone();
-        trace!("Metadata that exists here {:?}", parsed_metadata);
         let data_cache = metadata_entry.value().2.clone();
 
         PrefetchGetObject {
@@ -341,21 +340,19 @@ where
             bucket: bucket.to_owned(),
             object_id: ObjectId::new(key.to_owned(), etag),
             size,
-            parsed_metadata,
-            raw_metadata,
             should_parse_metadata: true,
-            data_cache,
+            cached_entry: (raw_metadata, parsed_metadata, data_cache),
         }
     }
 
     /// Ensures that the Parquet metadata is loaded, parsing and caching it if not already done.
     async fn ensure_parquet_metadata_loaded(&self) -> Result<(), PrefetchReadError<Client::ClientError>> {
-        if self.parsed_metadata.read().await.is_some() {
+        if self.cached_entry.1.read().await.is_some() {
             return Ok(());
         }
 
         {
-            let mut metadata_write = self.parsed_metadata.write().await;
+            let mut metadata_write = self.cached_entry.1.write().await;
             if metadata_write.is_none() {
                 let metadata = self.load_parquet_metadata().await?;
                 *metadata_write = Some(metadata);
@@ -390,7 +387,7 @@ where
         let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
             .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
 
-        let mut raw_metadata_write = self.raw_metadata.write().await;
+        let mut raw_metadata_write = self.cached_entry.0.write().await;
         *raw_metadata_write = Some(RawMetadata {
             bytes: ChecksummedBytes::new(raw_metadata),
             range: raw_metadata_range,
@@ -531,9 +528,7 @@ where
             self.object_id.etag().clone(),
             range,
             self.preferred_part_size,
-            self.data_cache.clone(),
-            self.parsed_metadata.clone(),
-            self.raw_metadata.clone(),
+            self.cached_entry.clone(),
         );
 
         // [read] will reset these if the reader stops making sequential requests

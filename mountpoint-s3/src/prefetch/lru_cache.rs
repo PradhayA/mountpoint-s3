@@ -169,16 +169,13 @@ mod tests {
         cache.add_entry(key1.clone(), 50);
         cache.add_entry(key2.clone(), 30);
 
-        assert_eq!(cache.touch_entry(&key1), true);
-        assert_eq!(cache.touch_entry(&key2), true);
-        assert_eq!(
-            cache.touch_entry(&CacheKey {
-                file_id: "file1".to_string(),
-                row_group: 1,
-                column: 0
-            }),
-            false
-        );
+        assert!(cache.touch_entry(&key1));
+        assert!(cache.touch_entry(&key2));
+        assert!(!cache.touch_entry(&CacheKey {
+            file_id: "file1".to_string(),
+            row_group: 1,
+            column: 0
+        }));
     }
 
     #[test]

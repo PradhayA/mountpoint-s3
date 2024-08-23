@@ -16,7 +16,7 @@ use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
 use crate::prefetch::PrefetchReadError;
 
-use super::{InMemoryCacheRef, MetadataRef, RawMetadataRef};
+use super::CacheEntry;
 
 /// [ObjectPartStream] implementation which maintains a [DataCache] for the object data
 /// retrieved by an [ObjectClient].
@@ -48,9 +48,7 @@ where
         if_match: ETag,
         range: RequestRange,
         _preferred_part_size: usize,
-        _in_memory_cache: InMemoryCacheRef,
-        _parsed_metadata: MetadataRef,
-        _raw_metadata: RawMetadataRef,
+        _cached_structure: CacheEntry,
     ) -> RequestTask<<Client as ObjectClient>::ClientError>
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
@@ -328,10 +326,7 @@ mod tests {
     use mountpoint_s3_client::mock_client::{MockClient, MockClientConfig, MockObject, Operation};
     use test_case::test_case;
 
-    use crate::{
-        data_cache::InMemoryDataCache,
-        prefetch::{InMemoryCacheRef, RawMetadataRef},
-    };
+    use crate::{data_cache::InMemoryDataCache, prefetch::CacheEntry};
 
     use super::*;
 
@@ -382,9 +377,7 @@ mod tests {
                 etag.clone(),
                 range,
                 0,
-                InMemoryCacheRef::default(),
-                MetadataRef::default(),
-                RawMetadataRef::default(),
+                CacheEntry::default(),
             );
             compare_read(&id, &object, request_task);
             get_object_counter.count()
@@ -401,9 +394,7 @@ mod tests {
                 etag.clone(),
                 range,
                 0,
-                InMemoryCacheRef::default(),
-                MetadataRef::default(),
-                RawMetadataRef::default(),
+                CacheEntry::default(),
             );
             compare_read(&id, &object, request_task);
             get_object_counter.count()
@@ -446,9 +437,7 @@ mod tests {
                     etag.clone(),
                     range,
                     0,
-                    InMemoryCacheRef::default(),
-                    MetadataRef::default(),
-                    RawMetadataRef::default(),
+                    CacheEntry::default(),
                 );
                 compare_read(&id, &object, request_task);
             }
