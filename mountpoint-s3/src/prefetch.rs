@@ -111,7 +111,13 @@ pub type ParquetPrefetcher<Runtime> = Prefetcher<ParquetPartStream<Runtime>>;
 pub type RowgroupColRanges = HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>;
 pub type MetadataRef = Arc<AsyncRwLock<Option<(ParsedMetadata, RowgroupColRanges)>>>;
 pub type RawMetadataRef = Arc<AsyncRwLock<Option<RawMetadata>>>;
-pub type CacheEntry = (RawMetadataRef, MetadataRef, InMemoryCacheRef);
+
+#[derive(Debug, Clone, Default)]
+pub struct CacheEntry {
+    pub raw_metadata: RawMetadataRef,
+    pub parsed_metadata: MetadataRef,
+    pub in_memory_cache: InMemoryCacheRef,
+}
 type CachedRef = Arc<DashMap<ObjectId, CacheEntry>>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
@@ -313,17 +319,11 @@ where
     ) -> Self {
         let metadata_entry = metadata_cache
             .entry(ObjectId::new(key.to_owned(), etag.clone()))
-            .or_insert_with(|| {
-                (
-                    Arc::new(AsyncRwLock::new(None)),
-                    Arc::new(AsyncRwLock::new(None)),
-                    Arc::new(AsyncRwLock::new(None)),
-                )
+            .or_insert_with(|| CacheEntry {
+                raw_metadata: Arc::new(AsyncRwLock::new(None)),
+                parsed_metadata: Arc::new(AsyncRwLock::new(None)),
+                in_memory_cache: Arc::new(AsyncRwLock::new(None)),
             });
-
-        let raw_metadata = metadata_entry.value().0.clone();
-        let parsed_metadata = metadata_entry.value().1.clone();
-        let data_cache = metadata_entry.value().2.clone();
 
         PrefetchGetObject {
             client,
@@ -341,18 +341,18 @@ where
             object_id: ObjectId::new(key.to_owned(), etag),
             size,
             should_parse_metadata: true,
-            cached_entry: (raw_metadata, parsed_metadata, data_cache),
+            cached_entry: metadata_entry.value().clone(),
         }
     }
 
     /// Ensures that the Parquet metadata is loaded, parsing and caching it if not already done.
     async fn ensure_parquet_metadata_loaded(&self) -> Result<(), PrefetchReadError<Client::ClientError>> {
-        if self.cached_entry.1.read().await.is_some() {
+        if self.cached_entry.parsed_metadata.read().await.is_some() {
             return Ok(());
         }
 
         {
-            let mut metadata_write = self.cached_entry.1.write().await;
+            let mut metadata_write = self.cached_entry.parsed_metadata.write().await;
             if metadata_write.is_none() {
                 let metadata = self.load_parquet_metadata().await?;
                 *metadata_write = Some(metadata);
@@ -387,7 +387,7 @@ where
         let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
             .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
 
-        let mut raw_metadata_write = self.cached_entry.0.write().await;
+        let mut raw_metadata_write = self.cached_entry.raw_metadata.write().await;
         *raw_metadata_write = Some(RawMetadata {
             bytes: ChecksummedBytes::new(raw_metadata),
             range: raw_metadata_range,

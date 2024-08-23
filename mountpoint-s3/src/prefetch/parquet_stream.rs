@@ -54,9 +54,9 @@ where
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
     {
-        let raw_metadata = cached_structure.0.clone();
-        let parsed_metadata = cached_structure.1.clone();
-        let in_mem_cache = cached_structure.2.clone();
+        let raw_metadata = cached_structure.raw_metadata.clone();
+        let parsed_metadata = cached_structure.parsed_metadata.clone();
+        let in_mem_cache = cached_structure.in_memory_cache.clone();
 
         let start = range.start();
         let size = range.len();
@@ -300,7 +300,7 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
 /// Moves entry (row group, col) to the back of LRU entry cache
 async fn move_entry_to_back(id: &ObjectId, row_group_col: &(usize, usize), lru_cache: &AsyncRwLock<LruCache>) {
     let key = CacheKey {
-        file_id: id.key().to_string(),
+        file_id: id.clone(),
         row_group: row_group_col.0,
         column: row_group_col.1,
     };
@@ -375,17 +375,17 @@ where
                 *cols = remaining_cols;
 
                 for (row_group_col, _col_range) in new_cols {
+                    if metadata.is_none() {
+                        break;
+                    }
+
                     let col_cache = cache.entry(row_group_col).or_insert_with(BTreeMap::new);
+                    let col_range = metadata.as_ref().unwrap().1.get(&row_group_col).unwrap();
                     if let Err(e) = merge_ranges(
                         col_cache,
                         part_range.clone(),
                         part.get_checksummed_bytes().clone(),
-                        metadata
-                            .as_ref()
-                            .unwrap()
-                            .1
-                            .get(&row_group_col)
-                            .expect("Expected a range for this row group and column"),
+                        col_range,
                     ) {
                         warn!("Error merging ranges: {:?}", e);
                     }
@@ -417,7 +417,7 @@ async fn lru_record(
     cache: &mut InMemoryCache,
 ) {
     let key = CacheKey {
-        file_id: id.key().to_string(),
+        file_id: id.clone(),
         row_group: row_group_col.0,
         column: row_group_col.1,
     };

@@ -98,7 +98,7 @@ where
     let read_size = METADATA_READ_SIZE.min(object_size);
     let raw_metadata_range_end = object_size;
     let raw_metadata_range_start = raw_metadata_range_end.saturating_sub(read_size);
-    let raw_metadata = match fetch_object_part(
+    let raw_metadata = fetch_object_part(
         &client,
         bucket,
         key,
@@ -106,10 +106,7 @@ where
         raw_metadata_range_start..raw_metadata_range_end,
     )
     .await
-    {
-        Ok(bytes) => bytes,
-        Err(_) => return Err(PrefetchReadError::MetadataParsingFailed),
-    };
+    .map_err(|_| PrefetchReadError::MetadataParsingFailed)?;
 
     let metadata_len = {
         let footer_bytes: [u8; 8] = raw_metadata[raw_metadata.len() - 8..]

@@ -2,9 +2,11 @@ use linked_hash_map::LinkedHashMap;
 use std::hash::Hash;
 use tracing::trace;
 
+use crate::object::ObjectId;
+
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct CacheKey {
-    pub file_id: String,
+    pub file_id: ObjectId,
     pub row_group: usize,
     pub column: usize,
 }
@@ -30,16 +32,11 @@ impl LruCache {
 
         let mut evicted = Vec::new();
         // If the entry already exists, update its size and move it to the back (most recently used)
-        if let Some(entry_size) = self.entries.get_mut(&key) {
-            self.memory_usage = self.memory_usage.saturating_sub(*entry_size);
-            *entry_size = size;
-            self.memory_usage += size;
-            self.entries.get_refresh(&key);
-        } else {
-            // Add the new entry
-            self.entries.insert(key.clone(), size);
-            self.memory_usage += size;
+        let insertion_entry = self.entries.insert(key.clone(), size);
+        if let Some(entry_size) = insertion_entry {
+            self.memory_usage = self.memory_usage.saturating_sub(entry_size);
         }
+        self.memory_usage += size;
 
         // Evict entries if memory limit is exceeded
         while self.memory_usage > self.memory_limit {
@@ -63,23 +60,25 @@ impl LruCache {
 
 #[cfg(test)]
 mod tests {
+    use mountpoint_s3_client::types::ETag;
+
     use super::*;
 
     #[test]
     fn test_add_entry_within_limit() {
         let mut cache = LruCache::new(100);
         let key1 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 0,
         };
         let key2 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 1,
         };
         let key3 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 1,
             column: 0,
         };
@@ -101,17 +100,17 @@ mod tests {
     fn test_add_entry_exceeding_limit() {
         let mut cache = LruCache::new(100);
         let key1 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 0,
         };
         let key2 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 1,
         };
         let key3 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 1,
             column: 0,
         };
@@ -121,7 +120,7 @@ mod tests {
         cache.add_entry(key3.clone(), 20);
 
         let key4 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 1,
             column: 1,
         };
@@ -134,12 +133,12 @@ mod tests {
     fn test_update_existing_entry() {
         let mut cache = LruCache::new(100);
         let key1 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 0,
         };
         let key2 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 1,
         };
@@ -156,12 +155,12 @@ mod tests {
     fn test_touch_entry() {
         let mut cache = LruCache::new(100);
         let key1 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 0,
         };
         let key2 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 1,
         };
@@ -172,7 +171,7 @@ mod tests {
         assert!(cache.touch_entry(&key1));
         assert!(cache.touch_entry(&key2));
         assert!(!cache.touch_entry(&CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 1,
             column: 0
         }));
@@ -182,17 +181,17 @@ mod tests {
     fn test_evict_multiple_entries() {
         let mut cache = LruCache::new(100);
         let key1 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 0,
         };
         let key2 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 1,
         };
         let key3 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 1,
             column: 0,
         };
@@ -202,7 +201,7 @@ mod tests {
         cache.add_entry(key3.clone(), 20);
 
         let key4 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 1,
             column: 1,
         };
@@ -215,17 +214,17 @@ mod tests {
     fn test_touch_entry_moves_to_back() {
         let mut cache = LruCache::new(100);
         let key1 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 0,
         };
         let key2 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 0,
             column: 1,
         };
         let key3 = CacheKey {
-            file_id: "file1".to_string(),
+            file_id: ObjectId::new("file1".to_owned(), ETag::for_tests()),
             row_group: 1,
             column: 0,
         };
