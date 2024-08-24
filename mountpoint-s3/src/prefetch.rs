@@ -109,7 +109,14 @@ where
 
 pub type ParquetPrefetcher<Runtime> = Prefetcher<ParquetPartStream<Runtime>>;
 pub type RowgroupColRanges = HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>;
-pub type MetadataRef = Arc<AsyncRwLock<Option<(ParsedMetadata, RowgroupColRanges)>>>;
+
+#[derive(Clone, Debug)]
+pub struct MetadataRanges {
+    pub parsed_metadata: ParsedMetadata,
+    pub rowgroup_col_ranges: RowgroupColRanges,
+}
+
+pub type MetadataRef = Arc<AsyncRwLock<Option<MetadataRanges>>>;
 pub type RawMetadataRef = Arc<AsyncRwLock<Option<RawMetadata>>>;
 
 #[derive(Debug, Clone, Default)]
@@ -363,15 +370,7 @@ where
     }
 
     /// Loads the Parquet metadata from the object store and stores it as a tree.
-    async fn load_parquet_metadata(
-        &self,
-    ) -> Result<
-        (
-            IntervalTree<u64, (usize, usize)>,
-            HashMap<(usize, usize), std::ops::Range<u64>>,
-        ),
-        PrefetchReadError<Client::ClientError>,
-    > {
+    async fn load_parquet_metadata(&self) -> Result<MetadataRanges, PrefetchReadError<Client::ClientError>> {
         let (raw_metadata, raw_metadata_range, metadata_start) = read_parquet_metadata(
             self.client.clone(),
             &self.bucket,
@@ -393,7 +392,14 @@ where
             range: raw_metadata_range,
         });
 
-        Ok(parse_byte_ranges_tree(&metadata))
+        let parsed = parse_byte_ranges_tree(&metadata);
+
+        let result = MetadataRanges {
+            parsed_metadata: parsed.0,
+            rowgroup_col_ranges: parsed.1,
+        };
+
+        Ok(result)
     }
 
     async fn try_read(

@@ -19,8 +19,10 @@ use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
 use crate::prefetch::{InMemoryCacheRef, PrefetchReadError};
 
-use super::parquet_prefetch::{CachedRanges, ColumnIndex, InMemoryCache, LruCacheRef, RangeKey, RowGroupIndex};
-use super::{CacheEntry, ParsedMetadata, RowgroupColRanges};
+use super::parquet_prefetch::{
+    CachedRanges, ColumnIndex, InMemoryCache, InMemoryRecord, LruCacheRef, RangeKey, RowGroupIndex,
+};
+use super::{CacheEntry, MetadataRanges, ParsedMetadata, RowgroupColRanges};
 
 type RowgroupCols = Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>;
 
@@ -105,7 +107,7 @@ where
 
                     let metadata = parsed_metadata.read().await.clone();
                     let mut rowgroup_cols: RowgroupCols = if let Some(metadata) = &metadata {
-                        get_row_groups_and_columns(&metadata.0, remaining_range.clone())
+                        get_row_groups_and_columns(&metadata.parsed_metadata, remaining_range.clone())
                     } else {
                         Vec::new()
                     };
@@ -244,7 +246,7 @@ async fn spawn_default_get_object_request<Client>(
 /// Tries to serve data from cache as much as possible
 async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     remaining_range: &mut Range<u64>,
-    metadata: &Option<(ParsedMetadata, RowgroupColRanges)>,
+    metadata: &Option<MetadataRanges>,
     in_mem_cache: &InMemoryCacheRef,
     id: &ObjectId,
     part_queue_producer: &PartQueueProducer<E>,
@@ -254,13 +256,18 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
         return false;
     }
 
-    let cache_guard = in_mem_cache.read().await;
-    if let Some((ref cache, ref lru_cache)) = *cache_guard {
+    let cache_guard: async_lock::RwLockReadGuard<Option<super::parquet_prefetch::InMemoryRecord>> =
+        in_mem_cache.read().await;
+    if let Some(InMemoryRecord {
+        in_memory_cache,
+        lru_cache,
+    }) = cache_guard.as_ref()
+    {
         for (row_group_col, col_range) in rowgroup_cols {
-            if let Some(col_cache) = cache.get(row_group_col) {
+            if let Some(col_cache) = in_memory_cache.get(row_group_col) {
                 let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
                 if !cached_ranges.is_empty() {
-                    move_entry_to_back(id, row_group_col, lru_cache).await; // Still move entry to back since this (rowgroup, col) is accessed
+                    move_entry_to_back(id, row_group_col, &lru_cache).await; // Still move entry to back since this (rowgroup, col) is accessed
                 }
                 for cached_range in &cached_ranges {
                     if cached_range.start >= col_range.end {
@@ -321,7 +328,7 @@ async fn fetch_from_client<Client>(
     in_mem_cache: &InMemoryCacheRef,
     cols: &mut RowgroupCols,
     part_queue_producer: &PartQueueProducer<Client::ClientError>,
-    metadata: &Option<(ParsedMetadata, RowgroupColRanges)>,
+    metadata: &Option<MetadataRanges>,
 ) -> Result<(), PrefetchReadError<Client::ClientError>>
 where
     Client: ObjectClient + Send + Sync + 'static,
@@ -336,16 +343,24 @@ where
     match get_from_client(client, bucket, id, prefetch_range, preferred_part_size).await {
         Ok(parts) => {
             let mut cache_guard = in_mem_cache.write().await;
-            let (cache, lru_cache) = cache_guard.get_or_insert_with(|| {
-                (HashMap::new(), AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)))
+            // let (cache, lru_cache) = cache_guard.get_or_insert_with(|| {
+            //     (HashMap::new(), AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)))
+            //     // 1 GB limit
+            // });
+
+            let in_memory_record = cache_guard.get_or_insert_with(|| {
+                InMemoryRecord {
+                    in_memory_cache: HashMap::new(),
+                    lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)),
+                }
                 // 1 GB limit
             });
 
             for part in parts {
                 let part_range = part.offset()..part.offset() + part.len() as u64;
                 // list of row group cols and the ranges they have
-                let mut ranges = Vec::new();
-                for (row_group_col, map) in cache.iter() {
+                let mut ranges: Vec<(_, _)> = Vec::new();
+                for (row_group_col, map) in in_memory_record.in_memory_cache.iter() {
                     ranges.push((*row_group_col, map.keys()));
                 }
 
@@ -379,8 +394,16 @@ where
                         break;
                     }
 
-                    let col_cache = cache.entry(row_group_col).or_insert_with(BTreeMap::new);
-                    let col_range = metadata.as_ref().unwrap().1.get(&row_group_col).unwrap();
+                    let col_cache = in_memory_record
+                        .in_memory_cache
+                        .entry(row_group_col)
+                        .or_insert_with(BTreeMap::new);
+                    let col_range = metadata
+                        .as_ref()
+                        .unwrap()
+                        .rowgroup_col_ranges
+                        .get(&row_group_col)
+                        .unwrap();
                     if let Err(e) = merge_ranges(
                         col_cache,
                         part_range.clone(),
@@ -390,7 +413,14 @@ where
                         warn!("Error merging ranges: {:?}", e);
                     }
 
-                    lru_record(id, row_group_col, &part, lru_cache, cache).await;
+                    lru_record(
+                        id,
+                        row_group_col,
+                        &part,
+                        &mut in_memory_record.lru_cache,
+                        &mut in_memory_record.in_memory_cache,
+                    )
+                    .await;
                 }
 
                 *remaining_range = part_range.end..remaining_range.end;
