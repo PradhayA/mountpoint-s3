@@ -22,7 +22,7 @@ use crate::prefetch::{InMemoryCacheRef, PrefetchReadError};
 use super::parquet_prefetch::{
     CachedRanges, ColumnIndex, InMemoryCache, InMemoryRecord, LruCacheRef, RangeKey, RowGroupIndex,
 };
-use super::{CacheEntry, MetadataRanges, ParsedMetadata, RowgroupColRanges};
+use super::{CacheEntry, MetadataRanges, ParsedMetadata};
 
 type RowgroupCols = Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>;
 
@@ -267,7 +267,7 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
             if let Some(col_cache) = in_memory_cache.get(row_group_col) {
                 let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
                 if !cached_ranges.is_empty() {
-                    move_entry_to_back(id, row_group_col, &lru_cache).await; // Still move entry to back since this (rowgroup, col) is accessed
+                    move_entry_to_back(id, row_group_col, lru_cache).await; // Still move entry to back since this (rowgroup, col) is accessed
                 }
                 for cached_range in &cached_ranges {
                     if cached_range.start >= col_range.end {

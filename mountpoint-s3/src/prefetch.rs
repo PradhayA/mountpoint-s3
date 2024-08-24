@@ -25,7 +25,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::task::Spawn;
-use intervaltree::IntervalTree;
 use metrics::{counter, histogram};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
@@ -128,11 +127,15 @@ pub struct CacheEntry {
 type CachedRef = Arc<DashMap<ObjectId, CacheEntry>>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
-pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
+pub fn parquet_prefetch<Runtime>(
+    runtime: Runtime,
+    mut prefetcher_config: PrefetcherConfig,
+) -> ParquetPrefetcher<Runtime>
 where
     Runtime: Spawn + Send + Sync + 'static,
 {
     let part_stream = ParquetPartStream::new(runtime);
+    prefetcher_config.use_parquet_prefetcher = true;
     Prefetcher::new(part_stream, prefetcher_config)
 }
 
@@ -168,6 +171,7 @@ pub struct PrefetcherConfig {
     /// The maximum distance the prefetcher will seek backwards before resetting and starting a new
     /// S3 request. We keep this much data in memory in addition to any inflight requests.
     pub max_backward_seek_distance: u64,
+    pub use_parquet_prefetcher: bool,
 }
 
 impl Default for PrefetcherConfig {
@@ -192,6 +196,7 @@ impl Default for PrefetcherConfig {
             // just start a new request instead.
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 1 * 1024 * 1024,
+            use_parquet_prefetcher: false,
         }
     }
 }
@@ -324,13 +329,22 @@ where
         etag: ETag,
         metadata_cache: CachedRef,
     ) -> Self {
-        let metadata_entry = metadata_cache
-            .entry(ObjectId::new(key.to_owned(), etag.clone()))
-            .or_insert_with(|| CacheEntry {
+        let metadata_entry = if config.use_parquet_prefetcher {
+            let cached_entry = metadata_cache
+                .entry(ObjectId::new(key.to_owned(), etag.clone()))
+                .or_insert_with(|| CacheEntry {
+                    raw_metadata: Arc::new(AsyncRwLock::new(None)),
+                    parsed_metadata: Arc::new(AsyncRwLock::new(None)),
+                    in_memory_cache: Arc::new(AsyncRwLock::new(None)),
+                });
+            cached_entry.value().clone()
+        } else {
+            CacheEntry {
                 raw_metadata: Arc::new(AsyncRwLock::new(None)),
                 parsed_metadata: Arc::new(AsyncRwLock::new(None)),
                 in_memory_cache: Arc::new(AsyncRwLock::new(None)),
-            });
+            }
+        };
 
         PrefetchGetObject {
             client,
@@ -347,8 +361,8 @@ where
             bucket: bucket.to_owned(),
             object_id: ObjectId::new(key.to_owned(), etag),
             size,
-            should_parse_metadata: true,
-            cached_entry: metadata_entry.value().clone(),
+            should_parse_metadata: config.use_parquet_prefetcher,
+            cached_entry: metadata_entry,
         }
     }
 
@@ -749,6 +763,7 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             max_forward_seek_wait_distance: test_config.max_forward_seek_wait_distance,
             max_backward_seek_distance: test_config.max_backward_seek_distance,
+            use_parquet_prefetcher: false,
         };
 
         let prefetcher = Prefetcher::new(part_stream, prefetcher_config);
