@@ -271,6 +271,7 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
                 }
                 for cached_range in &cached_ranges {
                     if cached_range.start >= col_range.end {
+                        metrics::counter!("prefetch.parquet_cache_misses").increment(1);
                         return false;
                     } // Return early since no point going forward from here
 
@@ -289,10 +290,12 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
                             part_queue_producer.push(Ok(part));
 
                             *remaining_range = part_end..remaining_range.end;
+                            metrics::counter!("prefetch.parquet_cache_hits").increment(1);
                             if remaining_range.is_empty() {
                                 return true;
                             }
                         } else {
+                            metrics::counter!("prefetch.parquet_cache_misses").increment(1);
                             return false; // Return early since no point going forward from here
                         }
                     }
@@ -300,7 +303,7 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
             }
         }
     }
-
+    metrics::counter!("prefetch.parquet_cache_misses").increment(1);
     false
 }
 
