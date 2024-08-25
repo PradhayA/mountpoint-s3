@@ -610,3 +610,228 @@ fn intersect_ranges(a: &Range<u64>, b: &Range<u64>) -> Option<Range<u64>> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checksums::ChecksummedBytes;
+    use crate::object::ObjectId;
+    use crate::prefetch::lru_cache::{CacheKey, LruCache};
+    use bytes::Bytes;
+    use intervaltree::IntervalTree;
+    use mountpoint_s3_client::types::ETag;
+    use std::collections::BTreeMap;
+    use std::iter::FromIterator;
+
+    #[test]
+    fn test_merge_ranges() {
+        let mut col_cache = BTreeMap::new();
+        let col_range = 0..100;
+
+        // Test case 1: Insert non-overlapping range
+        let new_range = 0..50;
+        let new_data = ChecksummedBytes::new(Bytes::from_static(&[1; 50]));
+        merge_ranges(&mut col_cache, new_range.clone(), new_data.clone(), &col_range).unwrap();
+        assert_eq!(col_cache.len(), 1);
+        assert_eq!(col_cache.get(&RangeKey(0..50)).unwrap().len(), 50);
+
+        // Test case 2: Insert overlapping range
+        let new_range = 25..75;
+        let new_data = ChecksummedBytes::new(Bytes::from_static(&[2; 50]));
+        merge_ranges(&mut col_cache, new_range.clone(), new_data.clone(), &col_range).unwrap();
+        assert_eq!(col_cache.len(), 1);
+        assert_eq!(col_cache.get(&RangeKey(0..75)).unwrap().len(), 75);
+
+        // Test case 3: Insert range that extends beyond column range
+        let new_range = 90..110;
+        let new_data = ChecksummedBytes::new(Bytes::from_static(&[3; 20]));
+        merge_ranges(&mut col_cache, new_range.clone(), new_data.clone(), &col_range).unwrap();
+        assert_eq!(col_cache.len(), 2);
+        assert_eq!(col_cache.get(&RangeKey(90..100)).unwrap().len(), 10);
+
+        // Test case 4: Insert range that completely overlaps existing ranges
+        let new_range = 0..100;
+        let new_data = ChecksummedBytes::new(Bytes::from_static(&[4; 100]));
+        merge_ranges(&mut col_cache, new_range.clone(), new_data.clone(), &col_range).unwrap();
+        assert_eq!(col_cache.len(), 1);
+        assert_eq!(col_cache.get(&RangeKey(0..100)).unwrap().len(), 100);
+    }
+
+    #[test]
+    fn test_intersect_ranges() {
+        assert_eq!(intersect_ranges(&(0..10), &(5..15)), Some(5..10));
+        assert_eq!(intersect_ranges(&(0..10), &(10..20)), None);
+        assert_eq!(intersect_ranges(&(0..10), &(5..8)), Some(5..8));
+        assert_eq!(intersect_ranges(&(0..10), &(0..10)), Some(0..10));
+        assert_eq!(intersect_ranges(&(0..10), &(11..20)), None);
+        assert_eq!(intersect_ranges(&(5..15), &(0..10)), Some(5..10));
+        assert_eq!(intersect_ranges(&(0..5), &(5..10)), None);
+    }
+
+    #[test]
+    fn test_get_row_groups_and_columns() {
+        let interval_tree: IntervalTree<u64, (usize, usize)> = IntervalTree::from_iter(vec![
+            (0..100, (0, 0)),
+            (100..200, (0, 1)),
+            (200..300, (1, 0)),
+            (300..400, (1, 1)),
+        ]);
+
+        let result = get_row_groups_and_columns(&interval_tree, 50..250);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], ((0, 0), 50..100));
+        assert_eq!(result[1], ((0, 1), 100..200));
+        assert_eq!(result[2], ((1, 0), 200..250));
+
+        let result = get_row_groups_and_columns(&interval_tree, 0..400);
+        assert_eq!(result.len(), 4);
+
+        let result = get_row_groups_and_columns(&interval_tree, 150..350);
+        assert_eq!(result.len(), 3);
+
+        let result = get_row_groups_and_columns(&interval_tree, 0..50);
+        assert_eq!(result.len(), 1);
+
+        let result = get_row_groups_and_columns(&interval_tree, 400..500);
+        assert_eq!(result.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_move_entry_to_back() {
+        let lru_cache = AsyncRwLock::new(LruCache::new(1000));
+        let id = ObjectId::new("test".to_string(), ETag::for_tests());
+        let row_group_col = (0, 0);
+
+        // Add some entries
+        {
+            let mut cache = lru_cache.write().await;
+            cache.add_entry(
+                CacheKey {
+                    file_id: id.clone(),
+                    row_group: 0,
+                    column: 0,
+                },
+                100,
+            );
+            cache.add_entry(
+                CacheKey {
+                    file_id: id.clone(),
+                    row_group: 0,
+                    column: 1,
+                },
+                100,
+            );
+            cache.add_entry(
+                CacheKey {
+                    file_id: id.clone(),
+                    row_group: 1,
+                    column: 0,
+                },
+                100,
+            );
+        }
+
+        move_entry_to_back(&id, &row_group_col, &lru_cache).await;
+
+        // Check if the entry was moved to the back
+        {
+            let cache = lru_cache.read().await;
+            let entries: Vec<_> = cache.entries.keys().collect();
+            assert_eq!(entries.last().unwrap().row_group, 0);
+            assert_eq!(entries.last().unwrap().column, 0);
+        }
+
+        // Move a non-existent entry
+        move_entry_to_back(&id, &(2, 0), &lru_cache).await;
+
+        // Check if the cache order remains unchanged
+        {
+            let cache = lru_cache.read().await;
+            let entries: Vec<_> = cache.entries.keys().collect();
+            assert_eq!(entries.last().unwrap().row_group, 0);
+            assert_eq!(entries.last().unwrap().column, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lru_record() {
+        let mut lru_cache = AsyncRwLock::new(LruCache::new(1000));
+        let mut cache = InMemoryCache::new();
+        let id = ObjectId::new("test".to_string(), ETag::for_tests());
+        let row_group_col = (0, 0);
+        let part = Part::new(id.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[1; 100])));
+
+        lru_record(&id, row_group_col, &part, &mut lru_cache, &mut cache).await;
+
+        // Check if the entry was added to the LRU cache
+        {
+            let cache = lru_cache.read().await;
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(
+                cache
+                    .entries
+                    .get(&CacheKey {
+                        file_id: id.clone(),
+                        row_group: 0,
+                        column: 0
+                    })
+                    .unwrap(),
+                &100
+            );
+        }
+
+        // Add more entries to test eviction
+        let part2 = Part::new(id.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[2; 901])));
+        lru_record(&id, (0, 1), &part2, &mut lru_cache, &mut cache).await;
+
+        // Check if the first entry was evicted
+        {
+            let cache = lru_cache.read().await;
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(
+                cache
+                    .entries
+                    .get(&CacheKey {
+                        file_id: id.clone(),
+                        row_group: 0,
+                        column: 1
+                    })
+                    .unwrap(),
+                &901
+            );
+        }
+
+        // Test with a different file id
+        let id2 = ObjectId::new("test2".to_string(), ETag::for_tests());
+        let part3 = Part::new(id2.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[3; 50])));
+        lru_record(&id2, (0, 0), &part3, &mut lru_cache, &mut cache).await;
+
+        // Check if both entries are present (total size is less than 1000)
+        {
+            let cache = lru_cache.read().await;
+            assert_eq!(cache.entries.len(), 2);
+            assert_eq!(
+                cache
+                    .entries
+                    .get(&CacheKey {
+                        file_id: id.clone(),
+                        row_group: 0,
+                        column: 1
+                    })
+                    .unwrap(),
+                &901
+            );
+            assert_eq!(
+                cache
+                    .entries
+                    .get(&CacheKey {
+                        file_id: id2.clone(),
+                        row_group: 0,
+                        column: 0
+                    })
+                    .unwrap(),
+                &50
+            );
+        }
+    }
+}

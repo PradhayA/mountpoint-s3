@@ -203,3 +203,43 @@ pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> (ParsedMetadata, Ro
     let interval_tree = IntervalTree::from_iter(elements);
     (interval_tree, rowgroup_col_ranges)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::prefetch::{
+        lru_cache::LruCache,
+        parquet_prefetch::{CachedRanges, InMemoryCache, InMemoryRecord, RangeKey},
+    };
+    pub use async_lock::RwLock as AsyncRwLock;
+
+    #[test]
+    fn test_range_key() {
+        let range1 = RangeKey(0..100);
+        let range2 = RangeKey(0..200);
+        let range3 = RangeKey(100..200);
+
+        assert!(range1 < range2);
+        assert!(range1 < range3);
+        assert!(range2 < range3);
+
+        assert_eq!(range1.cmp(&range1), std::cmp::Ordering::Equal);
+        assert_eq!(range1.cmp(&range2), std::cmp::Ordering::Less);
+        assert_eq!(range2.cmp(&range1), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_in_memory_record() {
+        let mut in_memory_cache = InMemoryCache::new();
+        in_memory_cache.insert((0, 0), CachedRanges::new());
+
+        let lru_cache = AsyncRwLock::new(LruCache::new(1000));
+
+        let record = InMemoryRecord {
+            in_memory_cache,
+            lru_cache,
+        };
+
+        assert_eq!(record.in_memory_cache.len(), 1);
+        assert!(record.in_memory_cache.contains_key(&(0, 0)));
+    }
+}

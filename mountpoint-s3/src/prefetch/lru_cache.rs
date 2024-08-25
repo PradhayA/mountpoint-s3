@@ -13,7 +13,7 @@ pub struct CacheKey {
 
 #[derive(Debug)]
 pub struct LruCache {
-    entries: LinkedHashMap<CacheKey, usize>,
+    pub entries: LinkedHashMap<CacheKey, usize>,
     memory_usage: usize,
     memory_limit: usize,
 }
