@@ -346,11 +346,6 @@ where
     match get_from_client(client, bucket, id, prefetch_range, preferred_part_size).await {
         Ok(parts) => {
             let mut cache_guard = in_mem_cache.write().await;
-            // let (cache, lru_cache) = cache_guard.get_or_insert_with(|| {
-            //     (HashMap::new(), AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)))
-            //     // 1 GB limit
-            // });
-
             let in_memory_record = cache_guard.get_or_insert_with(|| {
                 InMemoryRecord {
                     in_memory_cache: HashMap::new(),
