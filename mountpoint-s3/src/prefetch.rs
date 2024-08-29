@@ -25,6 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::task::Spawn;
+use lru_cache::LruCache;
 use metrics::{counter, histogram};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
@@ -45,7 +46,7 @@ use crate::prefetch::task::RequestTask;
 use crate::sync::Arc;
 
 pub use async_lock::RwLock as AsyncRwLock;
-pub use parquet_prefetch::{ColumnIndex, InMemoryCacheRef, ParsedMetadata, RawMetadata, RowGroupIndex};
+pub use parquet_prefetch::{ColumnIndex, InMemoryRecord, ParsedMetadata, RawMetadata, RowGroupIndex};
 
 /// Generic interface to handle reading data from an object.
 pub trait Prefetch {
@@ -115,16 +116,19 @@ pub struct MetadataRanges {
     pub rowgroup_col_ranges: RowgroupColRanges,
 }
 
-pub type MetadataRef = Arc<AsyncRwLock<Option<MetadataRanges>>>;
-pub type RawMetadataRef = Arc<AsyncRwLock<Option<RawMetadata>>>;
-
 #[derive(Debug, Clone, Default)]
 pub struct CacheEntry {
-    pub raw_metadata: RawMetadataRef,
-    pub parsed_metadata: MetadataRef,
-    pub in_memory_cache: InMemoryCacheRef,
+    pub state: Arc<AsyncRwLock<Option<CacheEntryState>>>,
 }
-type CachedRef = Arc<DashMap<ObjectId, CacheEntry>>;
+
+#[derive(Debug)]
+struct CacheEntryState {
+    raw_metadata: RawMetadata,
+    parsed_metadata: MetadataRanges,
+    in_memory_cache: InMemoryRecord,
+}
+
+type MetadataCache = DashMap<ObjectId, CacheEntry>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
 pub fn parquet_prefetch<Runtime>(
@@ -206,7 +210,7 @@ impl Default for PrefetcherConfig {
 pub struct Prefetcher<Stream> {
     part_stream: Arc<Stream>,
     config: PrefetcherConfig,
-    metadata_cache: CachedRef,
+    metadata_cache: Arc<MetadataCache>,
 }
 
 impl<Stream> Prefetcher<Stream>
@@ -216,11 +220,10 @@ where
     /// Create a new [Prefetcher] from the given [ObjectPartStream] instance.
     pub fn new(part_stream: Stream, config: PrefetcherConfig) -> Self {
         let part_stream = Arc::new(part_stream);
-        let metadata_cache: CachedRef = Arc::new(DashMap::new());
         Self {
             part_stream,
             config,
-            metadata_cache,
+            metadata_cache: Default::default(),
         }
     }
 }
@@ -327,23 +330,15 @@ where
         key: &str,
         size: u64,
         etag: ETag,
-        metadata_cache: CachedRef,
+        metadata_cache: Arc<MetadataCache>,
     ) -> Self {
         let metadata_entry = if config.use_parquet_prefetcher {
             let cached_entry = metadata_cache
                 .entry(ObjectId::new(key.to_owned(), etag.clone()))
-                .or_insert_with(|| CacheEntry {
-                    raw_metadata: Arc::new(AsyncRwLock::new(None)),
-                    parsed_metadata: Arc::new(AsyncRwLock::new(None)),
-                    in_memory_cache: Arc::new(AsyncRwLock::new(None)),
-                });
+                .or_default();
             cached_entry.value().clone()
         } else {
-            CacheEntry {
-                raw_metadata: Arc::new(AsyncRwLock::new(None)),
-                parsed_metadata: Arc::new(AsyncRwLock::new(None)),
-                in_memory_cache: Arc::new(AsyncRwLock::new(None)),
-            }
+            Default::default()
         };
 
         PrefetchGetObject {
@@ -368,23 +363,20 @@ where
 
     /// Ensures that the Parquet metadata is loaded, parsing and caching it if not already done.
     async fn ensure_parquet_metadata_loaded(&self) -> Result<(), PrefetchReadError<Client::ClientError>> {
-        if self.cached_entry.parsed_metadata.read().await.is_some() {
+        if self.cached_entry.state.read().await.is_some() {
             return Ok(());
         }
 
-        {
-            let mut metadata_write = self.cached_entry.parsed_metadata.write().await;
-            if metadata_write.is_none() {
-                let metadata = self.load_parquet_metadata().await?;
-                *metadata_write = Some(metadata);
-            }
+        let mut state = self.cached_entry.state.write().await;
+        if state.is_none() {
+            *state = Some(self.load_parquet_metadata().await?);
         }
 
         Ok(())
     }
 
     /// Loads the Parquet metadata from the object store and stores it as a tree.
-    async fn load_parquet_metadata(&self) -> Result<MetadataRanges, PrefetchReadError<Client::ClientError>> {
+    async fn load_parquet_metadata(&self) -> Result<CacheEntryState, PrefetchReadError<Client::ClientError>> {
         let (raw_metadata, raw_metadata_range, metadata_start) = read_parquet_metadata(
             self.client.clone(),
             &self.bucket,
@@ -400,20 +392,30 @@ where
         let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
             .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
 
-        let mut raw_metadata_write = self.cached_entry.raw_metadata.write().await;
-        *raw_metadata_write = Some(RawMetadata {
+        let raw_metadata = RawMetadata {
             bytes: ChecksummedBytes::new(raw_metadata),
             range: raw_metadata_range,
-        });
-
-        let parsed = parse_byte_ranges_tree(&metadata);
-
-        let result = MetadataRanges {
-            parsed_metadata: parsed.0,
-            rowgroup_col_ranges: parsed.1,
         };
 
-        Ok(result)
+        let (parsed_metadata, rowgroup_col_ranges ) = parse_byte_ranges_tree(&metadata);
+
+        let parsed_metadata = MetadataRanges {
+            parsed_metadata,
+            rowgroup_col_ranges,
+        };
+
+        let in_memory_cache = 
+            InMemoryRecord {
+                in_memory_cache: Default::default(),
+                lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)), // 1 GB limit
+            };
+            
+
+        Ok(CacheEntryState {
+            raw_metadata,
+            parsed_metadata,
+            in_memory_cache,
+        })
     }
 
     async fn try_read(

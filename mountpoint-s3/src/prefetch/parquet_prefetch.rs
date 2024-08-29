@@ -83,11 +83,9 @@ pub type LruCacheRef = AsyncRwLock<LruCache>;
 
 #[derive(Debug)]
 pub struct InMemoryRecord {
-    pub in_memory_cache: InMemoryCache,
+    pub in_memory_cache: AsyncRwLock<InMemoryCache>,
     pub lru_cache: LruCacheRef,
 }
-
-pub type InMemoryCacheRef = Arc<AsyncRwLock<Option<InMemoryRecord>>>;
 
 /// Read Parquet metadata using the given S3 client,
 /// returning the raw bytes and the byte range containing the footer.
@@ -225,21 +223,5 @@ mod tests {
         assert_eq!(range1.cmp(&range1), std::cmp::Ordering::Equal);
         assert_eq!(range1.cmp(&range2), std::cmp::Ordering::Less);
         assert_eq!(range2.cmp(&range1), std::cmp::Ordering::Greater);
-    }
-
-    #[test]
-    fn test_in_memory_record() {
-        let mut in_memory_cache = InMemoryCache::new();
-        in_memory_cache.insert((0, 0), CachedRanges::new());
-
-        let lru_cache = AsyncRwLock::new(LruCache::new(1000));
-
-        let record = InMemoryRecord {
-            in_memory_cache,
-            lru_cache,
-        };
-
-        assert_eq!(record.in_memory_cache.len(), 1);
-        assert!(record.in_memory_cache.contains_key(&(0, 0)));
     }
 }
