@@ -294,6 +294,8 @@ pub struct CliArgs {
         value_name = "ALGORITHM",
     )]
     pub upload_checksums: Option<UploadChecksums>,
+    #[clap(long, help = "Enable Parquet file prefetching", help_heading = ADVANCED_OPTIONS_HEADER)]
+    pub parquet_prefetch: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -759,17 +761,27 @@ where
         }
     }
 
-    // let prefetcher = default_prefetch(runtime, prefetcher_config); // Just for testing purposes (will make it a parameter to pass)
-    let prefetcher = parquet_prefetch(runtime, prefetcher_config);
-    create_filesystem(
-        client,
-        prefetcher,
-        &args.bucket_name,
-        &args.prefix.unwrap_or_default(),
-        filesystem_config,
-        fuse_config,
-        &bucket_description,
-    )
+    if args.parquet_prefetch {
+        create_filesystem(
+            client,
+            parquet_prefetch(runtime, prefetcher_config),
+            &args.bucket_name,
+            &args.prefix.unwrap_or_default(),
+            filesystem_config,
+            fuse_config,
+            &bucket_description,
+        )
+    } else {
+        create_filesystem(
+            client,
+            default_prefetch(runtime, prefetcher_config),
+            &args.bucket_name,
+            &args.prefix.unwrap_or_default(),
+            filesystem_config,
+            fuse_config,
+            &bucket_description,
+        )
+    }
 }
 
 fn create_filesystem<Client, Prefetcher>(
