@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -56,8 +56,6 @@ where
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
     {
-        //let cache_entry = cached_structure.clone();
-
         let start = range.start();
         let size = range.len();
         let (part_queue, part_queue_producer) = unbounded_part_queue();
@@ -712,13 +710,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_lru_record() {
-        let mut lru_cache = AsyncRwLock::new(LruCache::new(1000));
+        let lru_cache = AsyncRwLock::new(LruCache::new(1000));
         let mut cache = InMemoryCache::new();
         let id = ObjectId::new("test".to_string(), ETag::for_tests());
         let row_group_col = (0, 0);
         let part = Part::new(id.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[1; 100])));
 
-        lru_record(&id, row_group_col, &part, &mut lru_cache, &mut cache).await;
+        lru_record(&id, row_group_col, &part, &lru_cache, &mut cache).await;
 
         // Check if the entry was added to the LRU cache
         {
@@ -739,7 +737,7 @@ mod tests {
 
         // Add more entries to test eviction
         let part2 = Part::new(id.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[2; 901])));
-        lru_record(&id, (0, 1), &part2, &mut lru_cache, &mut cache).await;
+        lru_record(&id, (0, 1), &part2, &lru_cache, &mut cache).await;
 
         // Check if the first entry was evicted
         {
@@ -761,7 +759,7 @@ mod tests {
         // Test with a different file id
         let id2 = ObjectId::new("test2".to_string(), ETag::for_tests());
         let part3 = Part::new(id2.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[3; 50])));
-        lru_record(&id2, (0, 0), &part3, &mut lru_cache, &mut cache).await;
+        lru_record(&id2, (0, 0), &part3, &lru_cache, &mut cache).await;
 
         // Check if both entries are present (total size is less than 1000)
         {

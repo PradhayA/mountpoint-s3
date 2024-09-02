@@ -204,11 +204,7 @@ pub fn parse_byte_ranges_tree(metadata: &ParquetMetaData) -> (ParsedMetadata, Ro
 
 #[cfg(test)]
 mod tests {
-    use crate::prefetch::{
-        lru_cache::LruCache,
-        parquet_prefetch::{CachedRanges, InMemoryCache, InMemoryRecord, RangeKey},
-    };
-    pub use async_lock::RwLock as AsyncRwLock;
+    use crate::prefetch::parquet_prefetch::RangeKey;
 
     #[test]
     fn test_range_key() {

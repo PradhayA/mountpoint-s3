@@ -122,7 +122,7 @@ pub struct CacheEntry {
 }
 
 #[derive(Debug)]
-struct CacheEntryState {
+pub struct CacheEntryState {
     raw_metadata: RawMetadata,
     parsed_metadata: MetadataRanges,
     in_memory_cache: InMemoryRecord,
