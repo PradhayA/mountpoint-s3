@@ -17,8 +17,8 @@ use tracing::trace;
 
 use super::lru_cache::LruCache;
 use super::PrefetchReadError;
-use super::RowgroupColRanges;
 use crate::checksums::ChecksummedBytes;
+use crate::prefetch::parquet_stream::RowgroupColRanges;
 use crate::sync::Arc;
 
 pub use async_lock::RwLock as AsyncRwLock;

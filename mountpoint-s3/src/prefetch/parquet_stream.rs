@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -6,6 +6,7 @@ use std::time::Instant;
 pub use async_lock::RwLock as AsyncRwLock;
 use async_trait::async_trait;
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::task::{Spawn, SpawnExt};
 use futures::{pin_mut, StreamExt};
 use mountpoint_s3_client::{types::ETag, ObjectClient};
@@ -20,14 +21,36 @@ use crate::prefetch::part::Part;
 use crate::prefetch::part_queue::{unbounded_part_queue, PartQueueProducer};
 use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
-use crate::prefetch::{CacheEntryState, PrefetchReadError, RawMetadata};
+use crate::prefetch::{PrefetchReadError, RawMetadata};
 
 use super::parquet_prefetch::{
     CachedRanges, ColumnIndex, InMemoryCache, InMemoryRecord, LruCacheRef, RangeKey, RowGroupIndex,
 };
-use super::{MetadataCache, MetadataRanges, ParsedMetadata};
+use super::ParsedMetadata;
 
 type RowgroupCols = Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>;
+
+pub type RowgroupColRanges = HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>;
+
+#[derive(Clone, Debug)]
+pub struct MetadataRanges {
+    pub parsed_metadata: ParsedMetadata,
+    pub rowgroup_col_ranges: RowgroupColRanges,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CacheEntry {
+    pub state: Arc<AsyncRwLock<Option<CacheEntryState>>>,
+}
+
+#[derive(Debug)]
+pub struct CacheEntryState {
+    raw_metadata: RawMetadata,
+    parsed_metadata: MetadataRanges,
+    in_memory_cache: InMemoryRecord,
+}
+
+type MetadataCache = DashMap<ObjectId, CacheEntry>;
 
 #[derive(Debug)]
 pub struct ParquetPartStream<Runtime> {
@@ -36,8 +59,11 @@ pub struct ParquetPartStream<Runtime> {
 }
 
 impl<Runtime> ParquetPartStream<Runtime> {
-    pub fn new(runtime: Runtime, cache: Arc<MetadataCache>) -> Self {
-        Self { runtime, cache }
+    pub fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime,
+            cache: Arc::new(MetadataCache::new()),
+        }
     }
 }
 

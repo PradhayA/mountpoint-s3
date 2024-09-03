@@ -17,13 +17,11 @@ mod part_stream;
 mod seek_window;
 mod task;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt::Debug;
-use std::ops::Range;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use futures::task::Spawn;
 use metrics::{counter, histogram};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
@@ -105,35 +103,13 @@ where
 }
 
 pub type ParquetPrefetcher<Runtime> = Prefetcher<ParquetPartStream<Runtime>>;
-pub type RowgroupColRanges = HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>;
-
-#[derive(Clone, Debug)]
-pub struct MetadataRanges {
-    pub parsed_metadata: ParsedMetadata,
-    pub rowgroup_col_ranges: RowgroupColRanges,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CacheEntry {
-    pub state: Arc<AsyncRwLock<Option<CacheEntryState>>>,
-}
-
-#[derive(Debug)]
-pub struct CacheEntryState {
-    raw_metadata: RawMetadata,
-    parsed_metadata: MetadataRanges,
-    in_memory_cache: InMemoryRecord,
-}
-
-type MetadataCache = DashMap<ObjectId, CacheEntry>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
 pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
 where
     Runtime: Spawn + Send + Sync + 'static,
 {
-    let cache = Arc::new(MetadataCache::new());
-    let part_stream = ParquetPartStream::new(runtime, cache);
+    let part_stream = ParquetPartStream::new(runtime);
     Prefetcher::new(part_stream, prefetcher_config)
 }
 
