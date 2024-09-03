@@ -329,6 +329,15 @@ You can then start Mountpoint using the directory where the RAM disk was mounted
 mount-s3 DOC-EXAMPLE-BUCKET /path/to/mount --cache /mnt/mp-cache-tmpfs
 ```
 
+### Using format-aware prefetching for querying parquet files
+
+Rather than using the default prefetching, you can configure Mountpoint to use a specialsed prefetching strategy optimised for querying parquet files.
+You can do this by starting mountpoint with the `--parquet-prefetch` flag:
+
+```
+mount-s3 DOC-EXAMPLE-BUCKET /path/to/mount --parquet-prefetch
+```
+
 ### Using multiple Mountpoint processes on a host
 
 The cache directory is not reusable by other Mountpoint processes and will be cleaned at mount time and exit.

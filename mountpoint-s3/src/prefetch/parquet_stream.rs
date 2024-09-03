@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub use async_lock::RwLock as AsyncRwLock;
@@ -8,32 +9,35 @@ use bytes::Bytes;
 use futures::task::{Spawn, SpawnExt};
 use futures::{pin_mut, StreamExt};
 use mountpoint_s3_client::{types::ETag, ObjectClient};
+use parquet::file::footer::decode_metadata;
 use tracing::{debug_span, error, trace, warn, Instrument};
 
 use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::object::ObjectId;
 use crate::prefetch::lru_cache::{CacheKey, LruCache};
+use crate::prefetch::parquet_prefetch::{parse_byte_ranges_tree, read_parquet_metadata};
 use crate::prefetch::part::Part;
 use crate::prefetch::part_queue::{unbounded_part_queue, PartQueueProducer};
 use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
-use crate::prefetch::PrefetchReadError;
+use crate::prefetch::{CacheEntryState, PrefetchReadError, RawMetadata};
 
 use super::parquet_prefetch::{
     CachedRanges, ColumnIndex, InMemoryCache, InMemoryRecord, LruCacheRef, RangeKey, RowGroupIndex,
 };
-use super::{CacheEntry, MetadataRanges, ParsedMetadata};
+use super::{MetadataCache, MetadataRanges, ParsedMetadata};
 
 type RowgroupCols = Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>;
 
 #[derive(Debug)]
 pub struct ParquetPartStream<Runtime> {
     runtime: Runtime,
+    cache: Arc<MetadataCache>,
 }
 
 impl<Runtime> ParquetPartStream<Runtime> {
-    pub fn new(runtime: Runtime) -> Self {
-        Self { runtime }
+    pub fn new(runtime: Runtime, cache: Arc<MetadataCache>) -> Self {
+        Self { runtime, cache }
     }
 }
 
@@ -51,7 +55,6 @@ where
         if_match: ETag,
         range: RequestRange,
         preferred_part_size: usize,
-        cached_structure: CacheEntry,
     ) -> RequestTask<Client::ClientError>
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
@@ -67,8 +70,35 @@ where
             let span = debug_span!("prefetch", range=?range);
             let key = key.to_owned();
 
+            let ref_cache = self
+                .cache
+                .entry(ObjectId::new(key.to_owned(), if_match.clone()))
+                .or_default();
+
+            let cached_entry = ref_cache.value().clone();
+
             async move {
-                if let Some(cache_entry) = cached_structure.state.read().await.as_ref() {
+                // Check if metadata is already stored in the cache, if not, read, parse and store the metadata
+                if key.ends_with(".parquet") && !cached_entry.state.read().await.is_some() {
+                    let mut state = cached_entry.state.write().await;
+                    if state.is_none() {
+                        let result = parse_parquet_metadata(
+                            client.clone(),
+                            &bucket,
+                            &key,
+                            &if_match,
+                            range.object_size() as u64,
+                        )
+                        .await;
+
+                        if let Ok(cache_value) = result {
+                            *state = Some(cache_value);
+                        }
+                    }
+                }
+
+                // If everything is correct i.e. if it's a parquet file and the metadata was loaded properly
+                if let Some(cache_entry) = cached_entry.state.read().await.as_ref() {
                     let request_range = range.start()..range.end();
 
                     let mut remaining_range = request_range.clone();
@@ -87,7 +117,7 @@ where
                     }
 
                     // If range overlaps with the first 4 magic bytes, serve PAR1 straight away
-                    if remaining_range.start < 4 {
+                    if !remaining_range.is_empty() && remaining_range.start < 4 {
                         let overlap_start = remaining_range.start;
                         let overlap_end = std::cmp::min(remaining_range.end, 4);
                         let magic_bytes = ChecksummedBytes::new(Bytes::copy_from_slice(b"PAR1"));
@@ -96,7 +126,10 @@ where
                         remaining_range = overlap_end..remaining_range.end;
                     }
 
-                    let mut rowgroup_cols: RowgroupCols = get_row_groups_and_columns(&cache_entry.parsed_metadata.parsed_metadata, remaining_range.clone());
+                    let mut rowgroup_cols: RowgroupCols = get_row_groups_and_columns(
+                        &cache_entry.parsed_metadata.parsed_metadata,
+                        remaining_range.clone(),
+                    );
 
                     while !remaining_range.is_empty() {
                         let start = Instant::now();
@@ -158,6 +191,57 @@ where
 
         let task_handle = self.runtime.spawn_with_handle(request_task).unwrap();
         RequestTask::from_handle(task_handle, size, start, part_queue)
+    }
+}
+
+// Parse parquet metadata
+async fn parse_parquet_metadata<Client>(
+    client: Client,
+    bucket: &str,
+    key: &str,
+    if_match: &ETag,
+    object_size: u64,
+) -> Result<CacheEntryState, PrefetchReadError<Client::ClientError>>
+where
+    Client: ObjectClient + Clone + Send + Sync + 'static,
+{
+    if let Ok((raw_metadata, raw_metadata_range, metadata_start)) =
+        read_parquet_metadata(client.clone().into(), bucket, key, if_match, object_size).await
+    {
+        let metadata_len = raw_metadata.len() - 8;
+        let metadata_area = metadata_start - raw_metadata_range.start;
+
+        let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
+            .map_err(|_| PrefetchReadError::<Client::ClientError>::GetRequestTerminatedUnexpectedly);
+
+        let raw_metadata = RawMetadata {
+            bytes: ChecksummedBytes::new(raw_metadata),
+            range: raw_metadata_range,
+        };
+
+        if let Ok(metadata) = metadata {
+            let (parsed_metadata, rowgroup_col_ranges) = parse_byte_ranges_tree(&metadata);
+
+            let parsed_metadata = MetadataRanges {
+                parsed_metadata,
+                rowgroup_col_ranges,
+            };
+
+            let in_memory_cache = InMemoryRecord {
+                in_memory_cache: Default::default(),
+                lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)), // 1 GB limit
+            };
+
+            Ok(CacheEntryState {
+                raw_metadata,
+                parsed_metadata,
+                in_memory_cache,
+            })
+        } else {
+            Err(PrefetchReadError::<Client::ClientError>::GetRequestTerminatedUnexpectedly)
+        }
+    } else {
+        Err(PrefetchReadError::<Client::ClientError>::GetRequestTerminatedUnexpectedly)
     }
 }
 
@@ -236,45 +320,46 @@ async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     part_queue_producer: &PartQueueProducer<E>,
     rowgroup_cols: &RowgroupCols,
 ) -> bool {
-        for (row_group_col, col_range) in rowgroup_cols {
-            if let Some(col_cache) = in_mem_record.in_memory_cache.read().await.get(row_group_col) {
-                let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
-                if !cached_ranges.is_empty() {
-                    move_entry_to_back(id, row_group_col, &in_mem_record.lru_cache).await; // Still move entry to back since this (rowgroup, col) is accessed
-                }
-                for cached_range in &cached_ranges {
-                    if cached_range.start >= col_range.end {
-                        metrics::counter!("prefetch.parquet_cache_misses").increment(1);
-                        return false;
-                    } // Return early since no point going forward from here
+    for (row_group_col, col_range) in rowgroup_cols {
+        if let Some(col_cache) = in_mem_record.in_memory_cache.read().await.get(row_group_col) {
+            let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
+            if !cached_ranges.is_empty() {
+                move_entry_to_back(id, row_group_col, &in_mem_record.lru_cache).await;
+                // Still move entry to back since this (rowgroup, col) is accessed
+            }
+            for cached_range in &cached_ranges {
+                if cached_range.start >= col_range.end {
+                    metrics::counter!("prefetch.parquet_cache_misses").increment(1);
+                    return false;
+                } // Return early since no point going forward from here
 
-                    if let Some(intersection) = intersect_ranges(cached_range, remaining_range) {
-                        let data = col_cache.get(cached_range).unwrap();
-                        let part_start = intersection.start;
-                        let part_end = intersection.end;
-                        let data_offset = part_start - cached_range.start;
+                if let Some(intersection) = intersect_ranges(cached_range, remaining_range) {
+                    let data = col_cache.get(cached_range).unwrap();
+                    let part_start = intersection.start;
+                    let part_end = intersection.end;
+                    let data_offset = part_start - cached_range.start;
 
-                        if part_start == remaining_range.start {
-                            let part_data =
-                                data.slice(data_offset as usize..(data_offset + (part_end - part_start)) as usize);
-                            let part = Part::new(id.clone(), part_start, part_data);
+                    if part_start == remaining_range.start {
+                        let part_data =
+                            data.slice(data_offset as usize..(data_offset + (part_end - part_start)) as usize);
+                        let part = Part::new(id.clone(), part_start, part_data);
 
-                            trace!("Pushing part to queue from cache: {:?}", part_start..part_end);
-                            part_queue_producer.push(Ok(part));
+                        trace!("Pushing part to queue from cache: {:?}", part_start..part_end);
+                        part_queue_producer.push(Ok(part));
 
-                            *remaining_range = part_end..remaining_range.end;
-                            metrics::counter!("prefetch.parquet_cache_hits").increment(1);
-                            if remaining_range.is_empty() {
-                                return true;
-                            }
-                        } else {
-                            metrics::counter!("prefetch.parquet_cache_misses").increment(1);
-                            return false; // Return early since no point going forward from here
+                        *remaining_range = part_end..remaining_range.end;
+                        metrics::counter!("prefetch.parquet_cache_hits").increment(1);
+                        if remaining_range.is_empty() {
+                            return true;
                         }
+                    } else {
+                        metrics::counter!("prefetch.parquet_cache_misses").increment(1);
+                        return false; // Return early since no point going forward from here
                     }
                 }
             }
         }
+    }
     metrics::counter!("prefetch.parquet_cache_misses").increment(1);
     false
 }
@@ -352,13 +437,8 @@ where
                 *cols = remaining_cols;
 
                 for (row_group_col, _col_range) in new_cols {
-                    let col_cache = in_memory_cache
-                        .entry(row_group_col)
-                        .or_insert_with(BTreeMap::new);
-                    let col_range = metadata
-                        .rowgroup_col_ranges
-                        .get(&row_group_col)
-                        .unwrap();
+                    let col_cache = in_memory_cache.entry(row_group_col).or_insert_with(BTreeMap::new);
+                    let col_range = metadata.rowgroup_col_ranges.get(&row_group_col).unwrap();
                     if let Err(e) = merge_ranges(
                         col_cache,
                         part_range.clone(),

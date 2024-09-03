@@ -25,13 +25,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::task::Spawn;
-use lru_cache::LruCache;
 use metrics::{counter, histogram};
 use mountpoint_s3_client::error::{GetObjectError, ObjectClientError};
 use mountpoint_s3_client::types::ETag;
 use mountpoint_s3_client::ObjectClient;
-use parquet::file::footer::decode_metadata;
-use parquet_prefetch::{parse_byte_ranges_tree, read_parquet_metadata};
 use parquet_stream::ParquetPartStream;
 use thiserror::Error;
 use tracing::trace;
@@ -131,15 +128,12 @@ pub struct CacheEntryState {
 type MetadataCache = DashMap<ObjectId, CacheEntry>;
 
 /// Creates an instance of the parquet-specific [Prefetch].
-pub fn parquet_prefetch<Runtime>(
-    runtime: Runtime,
-    mut prefetcher_config: PrefetcherConfig,
-) -> ParquetPrefetcher<Runtime>
+pub fn parquet_prefetch<Runtime>(runtime: Runtime, prefetcher_config: PrefetcherConfig) -> ParquetPrefetcher<Runtime>
 where
     Runtime: Spawn + Send + Sync + 'static,
 {
-    let part_stream = ParquetPartStream::new(runtime);
-    prefetcher_config.use_parquet_prefetcher = true;
+    let cache = Arc::new(MetadataCache::new());
+    let part_stream = ParquetPartStream::new(runtime, cache);
     Prefetcher::new(part_stream, prefetcher_config)
 }
 
@@ -175,7 +169,6 @@ pub struct PrefetcherConfig {
     /// The maximum distance the prefetcher will seek backwards before resetting and starting a new
     /// S3 request. We keep this much data in memory in addition to any inflight requests.
     pub max_backward_seek_distance: u64,
-    pub use_parquet_prefetcher: bool,
 }
 
 impl Default for PrefetcherConfig {
@@ -200,7 +193,6 @@ impl Default for PrefetcherConfig {
             // just start a new request instead.
             max_forward_seek_wait_distance: 16 * 1024 * 1024,
             max_backward_seek_distance: 1 * 1024 * 1024,
-            use_parquet_prefetcher: false,
         }
     }
 }
@@ -210,7 +202,6 @@ impl Default for PrefetcherConfig {
 pub struct Prefetcher<Stream> {
     part_stream: Arc<Stream>,
     config: PrefetcherConfig,
-    metadata_cache: Arc<MetadataCache>,
 }
 
 impl<Stream> Prefetcher<Stream>
@@ -220,11 +211,7 @@ where
     /// Create a new [Prefetcher] from the given [ObjectPartStream] instance.
     pub fn new(part_stream: Stream, config: PrefetcherConfig) -> Self {
         let part_stream = Arc::new(part_stream);
-        Self {
-            part_stream,
-            config,
-            metadata_cache: Default::default(),
-        }
+        Self { part_stream, config }
     }
 }
 
@@ -253,7 +240,6 @@ where
             key,
             size,
             etag,
-            self.metadata_cache.clone(),
         )
     }
 }
@@ -283,8 +269,6 @@ pub struct PrefetchGetObject<Stream: ObjectPartStream, Client: ObjectClient> {
     next_request_size: usize,
     next_request_offset: u64,
     size: u64,
-    should_parse_metadata: bool,
-    cached_entry: CacheEntry,
 }
 
 #[async_trait]
@@ -330,17 +314,7 @@ where
         key: &str,
         size: u64,
         etag: ETag,
-        metadata_cache: Arc<MetadataCache>,
     ) -> Self {
-        let metadata_entry = if config.use_parquet_prefetcher {
-            let cached_entry = metadata_cache
-                .entry(ObjectId::new(key.to_owned(), etag.clone()))
-                .or_default();
-            cached_entry.value().clone()
-        } else {
-            Default::default()
-        };
-
         PrefetchGetObject {
             client,
             part_stream,
@@ -356,66 +330,7 @@ where
             bucket: bucket.to_owned(),
             object_id: ObjectId::new(key.to_owned(), etag),
             size,
-            should_parse_metadata: config.use_parquet_prefetcher,
-            cached_entry: metadata_entry,
         }
-    }
-
-    /// Ensures that the Parquet metadata is loaded, parsing and caching it if not already done.
-    async fn ensure_parquet_metadata_loaded(&self) -> Result<(), PrefetchReadError<Client::ClientError>> {
-        if self.cached_entry.state.read().await.is_some() {
-            return Ok(());
-        }
-
-        let mut state = self.cached_entry.state.write().await;
-        if state.is_none() {
-            *state = Some(self.load_parquet_metadata().await?);
-        }
-
-        Ok(())
-    }
-
-    /// Loads the Parquet metadata from the object store and stores it as a tree.
-    async fn load_parquet_metadata(&self) -> Result<CacheEntryState, PrefetchReadError<Client::ClientError>> {
-        let (raw_metadata, raw_metadata_range, metadata_start) = read_parquet_metadata(
-            self.client.clone(),
-            &self.bucket,
-            self.object_id.key(),
-            self.object_id.etag(),
-            self.size,
-        )
-        .await?;
-
-        let metadata_len = raw_metadata.len() - 8;
-        let metadata_area = metadata_start - raw_metadata_range.start;
-
-        let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
-            .map_err(|_| PrefetchReadError::GetRequestTerminatedUnexpectedly)?;
-
-        let raw_metadata = RawMetadata {
-            bytes: ChecksummedBytes::new(raw_metadata),
-            range: raw_metadata_range,
-        };
-
-        let (parsed_metadata, rowgroup_col_ranges ) = parse_byte_ranges_tree(&metadata);
-
-        let parsed_metadata = MetadataRanges {
-            parsed_metadata,
-            rowgroup_col_ranges,
-        };
-
-        let in_memory_cache = 
-            InMemoryRecord {
-                in_memory_cache: Default::default(),
-                lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)), // 1 GB limit
-            };
-            
-
-        Ok(CacheEntryState {
-            raw_metadata,
-            parsed_metadata,
-            in_memory_cache,
-        })
     }
 
     async fn try_read(
@@ -423,20 +338,6 @@ where
         offset: u64,
         length: usize,
     ) -> Result<ChecksummedBytes, PrefetchReadError<Client::ClientError>> {
-        // Initially check if file is a parquet file
-        if self.object_id.key().ends_with(".parquet") && self.should_parse_metadata {
-            trace!("Parquet file detected, getting metadata");
-            match self.ensure_parquet_metadata_loaded().await {
-                Ok(_) => {
-                    trace!("Parquet file metadata successfully loaded");
-                }
-                Err(_) => {
-                    self.should_parse_metadata = false;
-                    tracing::warn!("Metadata parsing failed, falling back to default behaviour");
-                }
-            }
-        }
-
         // Currently, we set preferred part size to the current read size.
         // Our assumption is that the read size will be the same for most sequential
         // read and it can be aligned to the size of prefetched chunks.
@@ -550,7 +451,6 @@ where
             self.object_id.etag().clone(),
             range,
             self.preferred_part_size,
-            self.cached_entry.clone(),
         );
 
         // [read] will reset these if the reader stops making sequential requests
@@ -765,7 +665,6 @@ mod tests {
             read_timeout: Duration::from_secs(5),
             max_forward_seek_wait_distance: test_config.max_forward_seek_wait_distance,
             max_backward_seek_distance: test_config.max_backward_seek_distance,
-            use_parquet_prefetcher: false,
         };
 
         let prefetcher = Prefetcher::new(part_stream, prefetcher_config);
