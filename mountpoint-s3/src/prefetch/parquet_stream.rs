@@ -38,16 +38,31 @@ pub struct MetadataRanges {
     pub rowgroup_col_ranges: RowgroupColRanges,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CacheEntry {
-    pub state: Arc<AsyncRwLock<Option<CacheEntryState>>>,
+    pub state: Arc<AsyncRwLock<CacheEntryState>>,
+}
+
+impl Default for CacheEntry {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AsyncRwLock::new(CacheEntryState::NotRead)),
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct CacheEntryState {
-    raw_metadata: RawMetadata,
-    parsed_metadata: MetadataRanges,
-    in_memory_cache: InMemoryRecord,
+pub struct CacheEntryValue {
+    pub raw_metadata: RawMetadata,
+    pub parsed_metadata: MetadataRanges,
+    pub in_memory_cache: InMemoryRecord,
+}
+
+#[derive(Debug)]
+pub enum CacheEntryState {
+    NotRead,
+    ReadSuccessfully { cache_entry_value: CacheEntryValue },
+    ParsingFailed,
 }
 
 type MetadataCache = DashMap<ObjectId, CacheEntry>;
@@ -105,39 +120,93 @@ where
 
             async move {
                 // Check if metadata is already stored in the cache, if not, read, parse and store the metadata
-                if key.ends_with(".parquet") && !cached_entry.state.read().await.is_some() {
-                    let mut state = cached_entry.state.write().await;
-                    if state.is_none() {
-                        let result = parse_parquet_metadata(
-                            client.clone(),
-                            &bucket,
-                            &key,
-                            &if_match,
-                            range.object_size() as u64,
-                        )
-                        .await;
+                if key.ends_with(".parquet") {
+                    let state = cached_entry.state.read().await;
+                    match &*state {
+                        CacheEntryState::NotRead => {
+                            drop(state);
+                            let mut state = cached_entry.state.write().await;
+                            if let CacheEntryState::NotRead = &*state {
+                                let result = parse_parquet_metadata(
+                                    client.clone(),
+                                    &bucket,
+                                    &key,
+                                    &if_match,
+                                    range.object_size() as u64,
+                                )
+                                .await;
 
-                        if let Ok(cache_value) = result {
-                            *state = Some(cache_value);
+                                if let Ok(cache_value) = result {
+                                    *state = CacheEntryState::ReadSuccessfully {
+                                        cache_entry_value: cache_value,
+                                    };
+                                } else {
+                                    *state = CacheEntryState::ParsingFailed;
+                                    drop(state);
+
+                                    // Fallback to the previous behavior from part_stream.rs
+                                    spawn_default_get_object_request(
+                                        client,
+                                        bucket,
+                                        &key,
+                                        if_match,
+                                        range,
+                                        preferred_part_size,
+                                        part_queue_producer,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
                         }
+                        CacheEntryState::ParsingFailed => {
+                            // Fallback to the previous behavior from part_stream.rs
+                            spawn_default_get_object_request(
+                                client,
+                                bucket,
+                                &key,
+                                if_match,
+                                range,
+                                preferred_part_size,
+                                part_queue_producer,
+                            )
+                            .await;
+                            return;
+                        }
+                        _ => {}
                     }
+                } else {
+                    // Fallback to the previous behavior from part_stream.rs
+                    spawn_default_get_object_request(
+                        client,
+                        bucket,
+                        &key,
+                        if_match,
+                        range,
+                        preferred_part_size,
+                        part_queue_producer,
+                    )
+                    .await;
+                    return;
                 }
 
                 // If everything is correct i.e. if it's a parquet file and the metadata was loaded properly
-                if let Some(cache_entry) = cached_entry.state.read().await.as_ref() {
+                if let CacheEntryState::ReadSuccessfully { cache_entry_value } = &*cached_entry.state.read().await {
                     let request_range = range.start()..range.end();
 
                     let mut remaining_range = request_range.clone();
                     let mut metadata_part = None;
 
                     // If range overlaps with the raw metadata, serve from RawMetadata cache
-                    if let Some(intersection) = intersect_ranges(&remaining_range, &cache_entry.raw_metadata.range) {
+                    if let Some(intersection) =
+                        intersect_ranges(&remaining_range, &cache_entry_value.raw_metadata.range)
+                    {
                         trace!("Metadata portion detected: fetching from cache");
                         remaining_range = remaining_range.start..intersection.start;
 
-                        let metadata_start = (intersection.start - cache_entry.raw_metadata.range.start) as usize;
-                        let metadata_end = (intersection.end - cache_entry.raw_metadata.range.start) as usize;
-                        let metadata_bytes = cache_entry.raw_metadata.bytes.slice(metadata_start..metadata_end);
+                        let metadata_start = (intersection.start - cache_entry_value.raw_metadata.range.start) as usize;
+                        let metadata_end = (intersection.end - cache_entry_value.raw_metadata.range.start) as usize;
+                        let metadata_bytes = cache_entry_value.raw_metadata.bytes.slice(metadata_start..metadata_end);
                         trace!("Metadata range start-end: {:?}-{:?}", metadata_start, metadata_end);
                         metadata_part = Some(Part::new(id.clone(), intersection.start, metadata_bytes));
                     }
@@ -153,7 +222,7 @@ where
                     }
 
                     let mut rowgroup_cols: RowgroupCols = get_row_groups_and_columns(
-                        &cache_entry.parsed_metadata.parsed_metadata,
+                        &cache_entry_value.parsed_metadata.parsed_metadata,
                         remaining_range.clone(),
                     );
 
@@ -161,7 +230,7 @@ where
                         let start = Instant::now();
                         let cache_read_success = try_serve_from_cache(
                             &mut remaining_range,
-                            &cache_entry.in_memory_cache,
+                            &cache_entry_value.in_memory_cache,
                             &id,
                             &part_queue_producer,
                             &rowgroup_cols,
@@ -179,10 +248,10 @@ where
                                 &id,
                                 &mut remaining_range,
                                 size as usize,
-                                &cache_entry.in_memory_cache,
+                                &cache_entry_value.in_memory_cache,
                                 &mut rowgroup_cols,
                                 &part_queue_producer,
-                                &cache_entry.parsed_metadata,
+                                &cache_entry_value.parsed_metadata,
                             )
                             .await
                             {
@@ -227,10 +296,11 @@ async fn parse_parquet_metadata<Client>(
     key: &str,
     if_match: &ETag,
     object_size: u64,
-) -> Result<CacheEntryState, PrefetchReadError<Client::ClientError>>
+) -> Result<CacheEntryValue, PrefetchReadError<Client::ClientError>>
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
+    trace!("In aslosd there");
     if let Ok((raw_metadata, raw_metadata_range, metadata_start)) =
         read_parquet_metadata(client.clone().into(), bucket, key, if_match, object_size).await
     {
@@ -257,8 +327,7 @@ where
                 in_memory_cache: Default::default(),
                 lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)), // 1 GB limit
             };
-
-            Ok(CacheEntryState {
+            Ok(CacheEntryValue {
                 raw_metadata,
                 parsed_metadata,
                 in_memory_cache,
@@ -283,6 +352,7 @@ async fn spawn_default_get_object_request<Client>(
 ) where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
+    trace!("Spawning default get object request");
     assert!(preferred_part_size > 0);
     let request_range = range.align(client.part_size().unwrap_or(8 * 1024 * 1024) as u64, true);
 
