@@ -300,44 +300,39 @@ async fn parse_parquet_metadata<Client>(
 where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
-    trace!("In aslosd there");
-    if let Ok((raw_metadata, raw_metadata_range, metadata_start)) =
-        read_parquet_metadata(client.clone().into(), bucket, key, if_match, object_size).await
-    {
-        let metadata_len = raw_metadata.len() - 8;
-        let metadata_area = metadata_start - raw_metadata_range.start;
+    let (raw_metadata, raw_metadata_range, metadata_start) =
+        read_parquet_metadata(client.clone().into(), bucket, key, if_match, object_size)
+            .await
+            .map_err(PrefetchReadError::from)?;
 
-        let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
-            .map_err(|_| PrefetchReadError::<Client::ClientError>::GetRequestTerminatedUnexpectedly);
+    let metadata_len = raw_metadata.len() - 8;
+    let metadata_area = metadata_start - raw_metadata_range.start;
 
-        let raw_metadata = RawMetadata {
-            bytes: ChecksummedBytes::new(raw_metadata),
-            range: raw_metadata_range,
-        };
+    let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
+        .map_err(|_| PrefetchReadError::<Client::ClientError>::MetadataParsingFailed)?;
 
-        if let Ok(metadata) = metadata {
-            let (parsed_metadata, rowgroup_col_ranges) = parse_byte_ranges_tree(&metadata);
+    let raw_metadata = RawMetadata {
+        bytes: ChecksummedBytes::new(raw_metadata),
+        range: raw_metadata_range,
+    };
 
-            let parsed_metadata = MetadataRanges {
-                parsed_metadata,
-                rowgroup_col_ranges,
-            };
+    let (parsed_metadata, rowgroup_col_ranges) = parse_byte_ranges_tree(&metadata);
 
-            let in_memory_cache = InMemoryRecord {
-                in_memory_cache: Default::default(),
-                lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)), // 1 GB limit
-            };
-            Ok(CacheEntryValue {
-                raw_metadata,
-                parsed_metadata,
-                in_memory_cache,
-            })
-        } else {
-            Err(PrefetchReadError::<Client::ClientError>::GetRequestTerminatedUnexpectedly)
-        }
-    } else {
-        Err(PrefetchReadError::<Client::ClientError>::GetRequestTerminatedUnexpectedly)
-    }
+    let parsed_metadata = MetadataRanges {
+        parsed_metadata,
+        rowgroup_col_ranges,
+    };
+
+    let in_memory_cache = InMemoryRecord {
+        in_memory_cache: Default::default(),
+        lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)), // 1 GB limit
+    };
+
+    Ok(CacheEntryValue {
+        raw_metadata,
+        parsed_metadata,
+        in_memory_cache,
+    })
 }
 
 /// Default spawn object request as in default_stream
