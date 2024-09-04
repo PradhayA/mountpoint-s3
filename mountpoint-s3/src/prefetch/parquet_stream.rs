@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,35 +33,30 @@ type RowgroupCols = Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>;
 pub type RowgroupColRanges = HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>;
 
 #[derive(Clone, Debug)]
-pub struct MetadataRanges {
-    pub parsed_metadata: ParsedMetadata,
-    pub rowgroup_col_ranges: RowgroupColRanges,
+struct MetadataRanges {
+    parsed_metadata: ParsedMetadata,
+    rowgroup_col_ranges: RowgroupColRanges,
 }
 
-#[derive(Debug, Clone)]
-pub struct CacheEntry {
-    pub state: Arc<AsyncRwLock<CacheEntryState>>,
-}
-
-impl Default for CacheEntry {
-    fn default() -> Self {
-        Self {
-            state: Arc::new(AsyncRwLock::new(CacheEntryState::NotRead)),
-        }
-    }
+#[derive(Debug, Clone, Default)]
+struct CacheEntry {
+    state: Arc<AsyncRwLock<CacheEntryState>>,
 }
 
 #[derive(Debug)]
-pub struct CacheEntryValue {
-    pub raw_metadata: RawMetadata,
-    pub parsed_metadata: MetadataRanges,
-    pub in_memory_cache: InMemoryRecord,
+struct CacheEntryValue {
+    raw_metadata: RawMetadata,
+    parsed_metadata: MetadataRanges,
+    in_memory_cache: InMemoryRecord,
 }
 
-#[derive(Debug)]
-pub enum CacheEntryState {
+#[derive(Debug, Default)]
+enum CacheEntryState {
+    #[default]
     NotRead,
-    ReadSuccessfully { cache_entry_value: CacheEntryValue },
+    ReadSuccessfully {
+        cache_entry_value: CacheEntryValue,
+    },
     ParsingFailed,
 }
 
@@ -119,14 +114,18 @@ where
             let cached_entry = ref_cache.value().clone();
 
             async move {
-                // Check if metadata is already stored in the cache, if not, read, parse and store the metadata
-                if key.ends_with(".parquet") {
+                // Tries to check if a cache entry exists i.e. whether it's been read before, whether parsing has been unsuccessful before, or if the parsing has already been successful
+                loop {
+                    if !key.ends_with(".parquet") {
+                        break; // Exit early and spawn default get object request
+                    };
+
                     let state = cached_entry.state.read().await;
-                    match &*state {
+                    match state.deref() {
                         CacheEntryState::NotRead => {
                             drop(state);
                             let mut state = cached_entry.state.write().await;
-                            if let CacheEntryState::NotRead = &*state {
+                            if matches!(*state, CacheEntryState::NotRead) {
                                 let result = parse_parquet_metadata(
                                     client.clone(),
                                     &bucket,
@@ -140,145 +139,110 @@ where
                                     *state = CacheEntryState::ReadSuccessfully {
                                         cache_entry_value: cache_value,
                                     };
+                                    continue; // Restart to check the updated state and serve from the cached metadata
                                 } else {
                                     *state = CacheEntryState::ParsingFailed;
-                                    drop(state);
-
-                                    // Fallback to the previous behavior from part_stream.rs
-                                    spawn_default_get_object_request(
-                                        client,
-                                        bucket,
-                                        &key,
-                                        if_match,
-                                        range,
-                                        preferred_part_size,
-                                        part_queue_producer,
-                                    )
-                                    .await;
-                                    return;
+                                    break; // Exit early and spawn default get object request
                                 }
                             }
+                            continue; // Restart in the rare case where the state updated between dropping read lock and obtaining write lock
                         }
                         CacheEntryState::ParsingFailed => {
-                            // Fallback to the previous behavior from part_stream.rs
-                            spawn_default_get_object_request(
-                                client,
-                                bucket,
-                                &key,
-                                if_match,
-                                range,
-                                preferred_part_size,
-                                part_queue_producer,
-                            )
-                            .await;
-                            return;
+                            break; // Exit early and spawn default get object request
                         }
-                        _ => {}
-                    }
-                } else {
-                    // Fallback to the previous behavior from part_stream.rs
-                    spawn_default_get_object_request(
-                        client,
-                        bucket,
-                        &key,
-                        if_match,
-                        range,
-                        preferred_part_size,
-                        part_queue_producer,
-                    )
-                    .await;
-                    return;
-                }
+                        CacheEntryState::ReadSuccessfully { cache_entry_value } => {
+                            let request_range = range.start()..range.end();
 
-                // If everything is correct i.e. if it's a parquet file and the metadata was loaded properly
-                if let CacheEntryState::ReadSuccessfully { cache_entry_value } = &*cached_entry.state.read().await {
-                    let request_range = range.start()..range.end();
+                            let mut remaining_range = request_range.clone();
+                            let mut metadata_part = None;
 
-                    let mut remaining_range = request_range.clone();
-                    let mut metadata_part = None;
-
-                    // If range overlaps with the raw metadata, serve from RawMetadata cache
-                    if let Some(intersection) =
-                        intersect_ranges(&remaining_range, &cache_entry_value.raw_metadata.range)
-                    {
-                        trace!("Metadata portion detected: fetching from cache");
-                        remaining_range = remaining_range.start..intersection.start;
-
-                        let metadata_start = (intersection.start - cache_entry_value.raw_metadata.range.start) as usize;
-                        let metadata_end = (intersection.end - cache_entry_value.raw_metadata.range.start) as usize;
-                        let metadata_bytes = cache_entry_value.raw_metadata.bytes.slice(metadata_start..metadata_end);
-                        trace!("Metadata range start-end: {:?}-{:?}", metadata_start, metadata_end);
-                        metadata_part = Some(Part::new(id.clone(), intersection.start, metadata_bytes));
-                    }
-
-                    // If range overlaps with the first 4 magic bytes, serve PAR1 straight away
-                    if !remaining_range.is_empty() && remaining_range.start < 4 {
-                        let overlap_start = remaining_range.start;
-                        let overlap_end = std::cmp::min(remaining_range.end, 4);
-                        let magic_bytes = ChecksummedBytes::new(Bytes::copy_from_slice(b"PAR1"));
-                        let partial = magic_bytes.slice(overlap_start as usize..overlap_end as usize);
-                        part_queue_producer.push(Ok(Part::new(id.clone(), overlap_start, partial)));
-                        remaining_range = overlap_end..remaining_range.end;
-                    }
-
-                    let mut rowgroup_cols: RowgroupCols = get_row_groups_and_columns(
-                        &cache_entry_value.parsed_metadata.parsed_metadata,
-                        remaining_range.clone(),
-                    );
-
-                    while !remaining_range.is_empty() {
-                        let start = Instant::now();
-                        let cache_read_success = try_serve_from_cache(
-                            &mut remaining_range,
-                            &cache_entry_value.in_memory_cache,
-                            &id,
-                            &part_queue_producer,
-                            &rowgroup_cols,
-                        )
-                        .await;
-                        trace!("Let elapsed {:?}", start.elapsed());
-                        let hist = metrics::histogram!("serve_from_cache");
-                        hist.record(start.elapsed().as_micros() as f64);
-
-                        if !cache_read_success {
-                            let size = remaining_range.end - remaining_range.start; // or let size = preferred_part_size; (needs more research)
-                            if let Err(e) = fetch_from_client(
-                                &client,
-                                &bucket,
-                                &id,
-                                &mut remaining_range,
-                                size as usize,
-                                &cache_entry_value.in_memory_cache,
-                                &mut rowgroup_cols,
-                                &part_queue_producer,
-                                &cache_entry_value.parsed_metadata,
-                            )
-                            .await
+                            // If range overlaps with the raw metadata, serve from RawMetadata cache
+                            if let Some(intersection) =
+                                intersect_ranges(&remaining_range, &cache_entry_value.raw_metadata.range)
                             {
-                                error!("Error fetching from client: {:?}", e);
-                                part_queue_producer.push(Err(e));
-                                return;
+                                trace!("Metadata portion detected: fetching from cache");
+                                remaining_range = remaining_range.start..intersection.start;
+
+                                let metadata_start =
+                                    (intersection.start - cache_entry_value.raw_metadata.range.start) as usize;
+                                let metadata_end =
+                                    (intersection.end - cache_entry_value.raw_metadata.range.start) as usize;
+                                let metadata_bytes =
+                                    cache_entry_value.raw_metadata.bytes.slice(metadata_start..metadata_end);
+                                trace!("Metadata range start-end: {:?}-{:?}", metadata_start, metadata_end);
+                                metadata_part = Some(Part::new(id.clone(), intersection.start, metadata_bytes));
                             }
+
+                            // If range overlaps with the first 4 magic bytes, serve PAR1 straight away
+                            if !remaining_range.is_empty() && remaining_range.start < 4 {
+                                let overlap_start = remaining_range.start;
+                                let overlap_end = std::cmp::min(remaining_range.end, 4);
+                                let magic_bytes = ChecksummedBytes::new(Bytes::copy_from_slice(b"PAR1"));
+                                let partial = magic_bytes.slice(overlap_start as usize..overlap_end as usize);
+                                part_queue_producer.push(Ok(Part::new(id.clone(), overlap_start, partial)));
+                                remaining_range = overlap_end..remaining_range.end;
+                            }
+
+                            let mut rowgroup_cols: RowgroupCols = get_row_groups_and_columns(
+                                &cache_entry_value.parsed_metadata.parsed_metadata,
+                                remaining_range.clone(),
+                            );
+
+                            while !remaining_range.is_empty() {
+                                let start = Instant::now();
+                                let cache_read_success = try_serve_from_cache(
+                                    &mut remaining_range,
+                                    &cache_entry_value.in_memory_cache,
+                                    &id,
+                                    &part_queue_producer,
+                                    &rowgroup_cols,
+                                )
+                                .await;
+                                trace!("Let elapsed {:?}", start.elapsed());
+                                let hist = metrics::histogram!("serve_from_cache");
+                                hist.record(start.elapsed().as_micros() as f64);
+
+                                if !cache_read_success {
+                                    let size = remaining_range.end - remaining_range.start; // or let size = preferred_part_size; (needs more research)
+                                    if let Err(e) = fetch_from_client(
+                                        &client,
+                                        &bucket,
+                                        &id,
+                                        &mut remaining_range,
+                                        size as usize,
+                                        &cache_entry_value.in_memory_cache,
+                                        &mut rowgroup_cols,
+                                        &part_queue_producer,
+                                        &cache_entry_value.parsed_metadata,
+                                    )
+                                    .await
+                                    {
+                                        error!("Error fetching from client: {:?}", e);
+                                        part_queue_producer.push(Err(e));
+                                        return; // Error fetching from the client, return early
+                                    }
+                                }
+                            }
+
+                            if let Some(metadata_part) = metadata_part {
+                                part_queue_producer.push(Ok(metadata_part));
+                            }
+                            return; // Completed get object request, return early
                         }
                     }
-
-                    if let Some(metadata_part) = metadata_part {
-                        part_queue_producer.push(Ok(metadata_part));
-                    }
-                } else {
-                    // Fallback to the previous behavior from part_stream.rs
-                    spawn_default_get_object_request(
-                        client,
-                        bucket,
-                        &key,
-                        if_match,
-                        range,
-                        preferred_part_size,
-                        part_queue_producer,
-                    )
-                    .await;
                 }
 
+                // Fallback to the previous behavior from part_stream.rs
+                spawn_default_get_object_request(
+                    client,
+                    bucket,
+                    &key,
+                    if_match,
+                    range,
+                    preferred_part_size,
+                    part_queue_producer,
+                )
+                .await;
                 trace!("request finished");
             }
             .instrument(span)
