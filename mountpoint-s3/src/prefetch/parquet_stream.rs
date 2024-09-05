@@ -1,39 +1,79 @@
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
+use std::ops::{Deref, Range};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub use async_lock::RwLock as AsyncRwLock;
 use async_trait::async_trait;
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::task::{Spawn, SpawnExt};
 use futures::{pin_mut, StreamExt};
 use mountpoint_s3_client::{types::ETag, ObjectClient};
+use parquet::file::footer::decode_metadata;
 use tracing::{debug_span, error, trace, warn, Instrument};
 
 use crate::checksums::{ChecksummedBytes, IntegrityError};
 use crate::object::ObjectId;
 use crate::prefetch::lru_cache::{CacheKey, LruCache};
+use crate::prefetch::parquet_prefetch::{parse_byte_ranges_tree, read_parquet_metadata};
 use crate::prefetch::part::Part;
 use crate::prefetch::part_queue::{unbounded_part_queue, PartQueueProducer};
 use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
-use crate::prefetch::{InMemoryCacheRef, PrefetchReadError};
+use crate::prefetch::{PrefetchReadError, RawMetadata};
 
 use super::parquet_prefetch::{
     CachedRanges, ColumnIndex, InMemoryCache, InMemoryRecord, LruCacheRef, RangeKey, RowGroupIndex,
 };
-use super::{CacheEntry, MetadataRanges, ParsedMetadata};
+use super::ParsedMetadata;
 
 type RowgroupCols = Vec<((RowGroupIndex, ColumnIndex), Range<u64>)>;
+
+pub type RowgroupColRanges = HashMap<(RowGroupIndex, ColumnIndex), Range<u64>>;
+
+#[derive(Clone, Debug)]
+struct MetadataRanges {
+    parsed_metadata: ParsedMetadata,
+    rowgroup_col_ranges: RowgroupColRanges,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CacheEntry {
+    state: Arc<AsyncRwLock<CacheEntryState>>,
+}
+
+#[derive(Debug)]
+struct CacheEntryValue {
+    raw_metadata: RawMetadata,
+    parsed_metadata: MetadataRanges,
+    in_memory_cache: InMemoryRecord,
+}
+
+#[derive(Debug, Default)]
+enum CacheEntryState {
+    #[default]
+    NotRead,
+    ReadSuccessfully {
+        cache_entry_value: CacheEntryValue,
+    },
+    ParsingFailed,
+}
+
+type MetadataCache = DashMap<ObjectId, CacheEntry>;
 
 #[derive(Debug)]
 pub struct ParquetPartStream<Runtime> {
     runtime: Runtime,
+    cache: Arc<MetadataCache>,
 }
 
 impl<Runtime> ParquetPartStream<Runtime> {
     pub fn new(runtime: Runtime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            cache: Arc::new(MetadataCache::new()),
+        }
     }
 }
 
@@ -51,15 +91,10 @@ where
         if_match: ETag,
         range: RequestRange,
         preferred_part_size: usize,
-        cached_structure: CacheEntry,
     ) -> RequestTask<Client::ClientError>
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
     {
-        let raw_metadata = cached_structure.raw_metadata.clone();
-        let parsed_metadata = cached_structure.parsed_metadata.clone();
-        let in_mem_cache = cached_structure.in_memory_cache.clone();
-
         let start = range.start();
         let size = range.len();
         let (part_queue, part_queue_producer) = unbounded_part_queue();
@@ -71,101 +106,143 @@ where
             let span = debug_span!("prefetch", range=?range);
             let key = key.to_owned();
 
+            let ref_cache = self
+                .cache
+                .entry(ObjectId::new(key.to_owned(), if_match.clone()))
+                .or_default();
+
+            let cached_entry = ref_cache.value().clone();
+
             async move {
-                let is_parquet_file = key.ends_with(".parquet");
-                let metadata_available = raw_metadata.read().await.is_some();
-
-                if is_parquet_file && metadata_available {
-                    let request_range = range.start()..range.end();
-
-                    let mut remaining_range = request_range.clone();
-                    let mut metadata_part = None;
-
-                    // If range overlaps with the raw metadata, serve from RawMetadata cache
-                    if let Some(raw_metadata_wrap) = raw_metadata.read().await.as_ref() {
-                        if let Some(intersection) = intersect_ranges(&remaining_range, &raw_metadata_wrap.range) {
-                            trace!("Metadata portion detected: fetching from cache");
-                            remaining_range = remaining_range.start..intersection.start;
-
-                            let metadata_start = (intersection.start - raw_metadata_wrap.range.start) as usize;
-                            let metadata_end = (intersection.end - raw_metadata_wrap.range.start) as usize;
-                            let metadata_bytes = raw_metadata_wrap.bytes.slice(metadata_start..metadata_end);
-                            trace!("Metadata range start-end: {:?}-{:?}", metadata_start, metadata_end);
-                            metadata_part = Some(Part::new(id.clone(), intersection.start, metadata_bytes));
-                        }
-                    }
-
-                    // If range overlaps with the first 4 magic bytes, serve PAR1 straight away
-                    if remaining_range.start < 4 {
-                        let overlap_start = remaining_range.start;
-                        let overlap_end = std::cmp::min(remaining_range.end, 4);
-                        let magic_bytes = ChecksummedBytes::new(Bytes::copy_from_slice(b"PAR1"));
-                        let partial = magic_bytes.slice(overlap_start as usize..overlap_end as usize);
-                        part_queue_producer.push(Ok(Part::new(id.clone(), overlap_start, partial)));
-                        remaining_range = overlap_end..remaining_range.end;
-                    }
-
-                    let metadata = parsed_metadata.read().await.clone();
-                    let mut rowgroup_cols: RowgroupCols = if let Some(metadata) = &metadata {
-                        get_row_groups_and_columns(&metadata.parsed_metadata, remaining_range.clone())
-                    } else {
-                        Vec::new()
+                // Tries to check if a cache entry exists i.e. whether it's been read before, whether parsing has been unsuccessful before, or if the parsing has already been successful
+                loop {
+                    if !key.ends_with(".parquet") {
+                        break; // Exit early and spawn default get object request
                     };
 
-                    while !remaining_range.is_empty() {
-                        let start = Instant::now();
-                        let cache_read_success = try_serve_from_cache(
-                            &mut remaining_range,
-                            &metadata,
-                            &in_mem_cache,
-                            &id,
-                            &part_queue_producer,
-                            &rowgroup_cols,
-                        )
-                        .await;
-                        trace!("Let elapsed {:?}", start.elapsed());
-                        let hist = metrics::histogram!("serve_from_cache");
-                        hist.record(start.elapsed().as_micros() as f64);
+                    let state = cached_entry.state.read().await;
+                    match state.deref() {
+                        CacheEntryState::NotRead => {
+                            drop(state);
+                            let mut state = cached_entry.state.write().await;
+                            if matches!(*state, CacheEntryState::NotRead) {
+                                let result = parse_parquet_metadata(
+                                    client.clone(),
+                                    &bucket,
+                                    &key,
+                                    &if_match,
+                                    range.object_size() as u64,
+                                )
+                                .await;
 
-                        if !cache_read_success {
-                            let size = remaining_range.end - remaining_range.start; // or let size = preferred_part_size; (needs more research)
-                            if let Err(e) = fetch_from_client(
-                                &client,
-                                &bucket,
-                                &id,
-                                &mut remaining_range,
-                                size as usize,
-                                &in_mem_cache,
-                                &mut rowgroup_cols,
-                                &part_queue_producer,
-                                &metadata,
-                            )
-                            .await
-                            {
-                                error!("Error fetching from client: {:?}", e);
-                                part_queue_producer.push(Err(e));
-                                return;
+                                if let Ok(cache_value) = result {
+                                    *state = CacheEntryState::ReadSuccessfully {
+                                        cache_entry_value: cache_value,
+                                    };
+                                    continue; // Restart to check the updated state and serve from the cached metadata
+                                } else {
+                                    *state = CacheEntryState::ParsingFailed;
+                                    break; // Exit early and spawn default get object request
+                                }
                             }
+                            continue; // Restart in the rare case where the state updated between dropping read lock and obtaining write lock
+                        }
+                        CacheEntryState::ParsingFailed => {
+                            break; // Exit early and spawn default get object request
+                        }
+                        CacheEntryState::ReadSuccessfully { cache_entry_value } => {
+                            let request_range = range.start()..range.end();
+
+                            let mut remaining_range = request_range.clone();
+                            let mut metadata_part = None;
+
+                            // If range overlaps with the raw metadata, serve from RawMetadata cache
+                            if let Some(intersection) =
+                                intersect_ranges(&remaining_range, &cache_entry_value.raw_metadata.range)
+                            {
+                                trace!("Metadata portion detected: fetching from cache");
+                                remaining_range = remaining_range.start..intersection.start;
+
+                                let metadata_start =
+                                    (intersection.start - cache_entry_value.raw_metadata.range.start) as usize;
+                                let metadata_end =
+                                    (intersection.end - cache_entry_value.raw_metadata.range.start) as usize;
+                                let metadata_bytes =
+                                    cache_entry_value.raw_metadata.bytes.slice(metadata_start..metadata_end);
+                                trace!("Metadata range start-end: {:?}-{:?}", metadata_start, metadata_end);
+                                metadata_part = Some(Part::new(id.clone(), intersection.start, metadata_bytes));
+                            }
+
+                            // If range overlaps with the first 4 magic bytes, serve PAR1 straight away
+                            if !remaining_range.is_empty() && remaining_range.start < 4 {
+                                let overlap_start = remaining_range.start;
+                                let overlap_end = std::cmp::min(remaining_range.end, 4);
+                                let magic_bytes = ChecksummedBytes::new(Bytes::copy_from_slice(b"PAR1"));
+                                let partial = magic_bytes.slice(overlap_start as usize..overlap_end as usize);
+                                part_queue_producer.push(Ok(Part::new(id.clone(), overlap_start, partial)));
+                                remaining_range = overlap_end..remaining_range.end;
+                            }
+
+                            let mut rowgroup_cols: RowgroupCols = get_row_groups_and_columns(
+                                &cache_entry_value.parsed_metadata.parsed_metadata,
+                                remaining_range.clone(),
+                            );
+
+                            while !remaining_range.is_empty() {
+                                let start = Instant::now();
+                                let cache_read_success = try_serve_from_cache(
+                                    &mut remaining_range,
+                                    &cache_entry_value.in_memory_cache,
+                                    &id,
+                                    &part_queue_producer,
+                                    &rowgroup_cols,
+                                )
+                                .await;
+                                trace!("Let elapsed {:?}", start.elapsed());
+                                let hist = metrics::histogram!("serve_from_cache");
+                                hist.record(start.elapsed().as_micros() as f64);
+
+                                if !cache_read_success {
+                                    let size = remaining_range.end - remaining_range.start; // or let size = preferred_part_size; (needs more research)
+                                    if let Err(e) = fetch_from_client(
+                                        &client,
+                                        &bucket,
+                                        &id,
+                                        &mut remaining_range,
+                                        size as usize,
+                                        &cache_entry_value.in_memory_cache,
+                                        &mut rowgroup_cols,
+                                        &part_queue_producer,
+                                        &cache_entry_value.parsed_metadata,
+                                    )
+                                    .await
+                                    {
+                                        error!("Error fetching from client: {:?}", e);
+                                        part_queue_producer.push(Err(e));
+                                        return; // Error fetching from the client, return early
+                                    }
+                                }
+                            }
+
+                            if let Some(metadata_part) = metadata_part {
+                                part_queue_producer.push(Ok(metadata_part));
+                            }
+                            return; // Completed get object request, return early
                         }
                     }
-
-                    if let Some(metadata_part) = metadata_part {
-                        part_queue_producer.push(Ok(metadata_part));
-                    }
-                } else {
-                    // Fallback to the previous behavior from part_stream.rs
-                    spawn_default_get_object_request(
-                        client,
-                        bucket,
-                        &key,
-                        if_match,
-                        range,
-                        preferred_part_size,
-                        part_queue_producer,
-                    )
-                    .await;
                 }
 
+                // Fallback to the previous behavior from part_stream.rs
+                spawn_default_get_object_request(
+                    client,
+                    bucket,
+                    &key,
+                    if_match,
+                    range,
+                    preferred_part_size,
+                    part_queue_producer,
+                )
+                .await;
                 trace!("request finished");
             }
             .instrument(span)
@@ -174,6 +251,52 @@ where
         let task_handle = self.runtime.spawn_with_handle(request_task).unwrap();
         RequestTask::from_handle(task_handle, size, start, part_queue)
     }
+}
+
+// Parse parquet metadata
+async fn parse_parquet_metadata<Client>(
+    client: Client,
+    bucket: &str,
+    key: &str,
+    if_match: &ETag,
+    object_size: u64,
+) -> Result<CacheEntryValue, PrefetchReadError<Client::ClientError>>
+where
+    Client: ObjectClient + Clone + Send + Sync + 'static,
+{
+    let (raw_metadata, raw_metadata_range, metadata_start) =
+        read_parquet_metadata(client.clone().into(), bucket, key, if_match, object_size)
+            .await
+            .map_err(PrefetchReadError::from)?;
+
+    let metadata_len = raw_metadata.len() - 8;
+    let metadata_area = metadata_start - raw_metadata_range.start;
+
+    let metadata = decode_metadata(&raw_metadata[metadata_area as usize..metadata_len])
+        .map_err(|_| PrefetchReadError::<Client::ClientError>::MetadataParsingFailed)?;
+
+    let raw_metadata = RawMetadata {
+        bytes: ChecksummedBytes::new(raw_metadata),
+        range: raw_metadata_range,
+    };
+
+    let (parsed_metadata, rowgroup_col_ranges) = parse_byte_ranges_tree(&metadata);
+
+    let parsed_metadata = MetadataRanges {
+        parsed_metadata,
+        rowgroup_col_ranges,
+    };
+
+    let in_memory_cache = InMemoryRecord {
+        in_memory_cache: Default::default(),
+        lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)), // 1 GB limit
+    };
+
+    Ok(CacheEntryValue {
+        raw_metadata,
+        parsed_metadata,
+        in_memory_cache,
+    })
 }
 
 /// Default spawn object request as in default_stream
@@ -188,6 +311,7 @@ async fn spawn_default_get_object_request<Client>(
 ) where
     Client: ObjectClient + Clone + Send + Sync + 'static,
 {
+    trace!("Spawning default get object request");
     assert!(preferred_part_size > 0);
     let request_range = range.align(client.part_size().unwrap_or(8 * 1024 * 1024) as u64, true);
 
@@ -246,58 +370,46 @@ async fn spawn_default_get_object_request<Client>(
 /// Tries to serve data from cache as much as possible
 async fn try_serve_from_cache<E: std::error::Error + Send + Sync + 'static>(
     remaining_range: &mut Range<u64>,
-    metadata: &Option<MetadataRanges>,
-    in_mem_cache: &InMemoryCacheRef,
+    in_mem_record: &InMemoryRecord,
     id: &ObjectId,
     part_queue_producer: &PartQueueProducer<E>,
     rowgroup_cols: &RowgroupCols,
 ) -> bool {
-    if metadata.is_none() {
-        return false;
-    }
+    for (row_group_col, col_range) in rowgroup_cols {
+        if let Some(col_cache) = in_mem_record.in_memory_cache.read().await.get(row_group_col) {
+            let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
+            if !cached_ranges.is_empty() {
+                move_entry_to_back(id, row_group_col, &in_mem_record.lru_cache).await;
+                // Still move entry to back since this (rowgroup, col) is accessed
+            }
+            for cached_range in &cached_ranges {
+                if cached_range.start >= col_range.end {
+                    metrics::counter!("prefetch.parquet_cache_misses").increment(1);
+                    return false;
+                } // Return early since no point going forward from here
 
-    let cache_guard: async_lock::RwLockReadGuard<Option<super::parquet_prefetch::InMemoryRecord>> =
-        in_mem_cache.read().await;
-    if let Some(InMemoryRecord {
-        in_memory_cache,
-        lru_cache,
-    }) = cache_guard.as_ref()
-    {
-        for (row_group_col, col_range) in rowgroup_cols {
-            if let Some(col_cache) = in_memory_cache.get(row_group_col) {
-                let cached_ranges: Vec<_> = col_cache.keys().cloned().collect();
-                if !cached_ranges.is_empty() {
-                    move_entry_to_back(id, row_group_col, lru_cache).await; // Still move entry to back since this (rowgroup, col) is accessed
-                }
-                for cached_range in &cached_ranges {
-                    if cached_range.start >= col_range.end {
-                        metrics::counter!("prefetch.parquet_cache_misses").increment(1);
-                        return false;
-                    } // Return early since no point going forward from here
+                if let Some(intersection) = intersect_ranges(cached_range, remaining_range) {
+                    let data = col_cache.get(cached_range).unwrap();
+                    let part_start = intersection.start;
+                    let part_end = intersection.end;
+                    let data_offset = part_start - cached_range.start;
 
-                    if let Some(intersection) = intersect_ranges(cached_range, remaining_range) {
-                        let data = col_cache.get(cached_range).unwrap();
-                        let part_start = intersection.start;
-                        let part_end = intersection.end;
-                        let data_offset = part_start - cached_range.start;
+                    if part_start == remaining_range.start {
+                        let part_data =
+                            data.slice(data_offset as usize..(data_offset + (part_end - part_start)) as usize);
+                        let part = Part::new(id.clone(), part_start, part_data);
 
-                        if part_start == remaining_range.start {
-                            let part_data =
-                                data.slice(data_offset as usize..(data_offset + (part_end - part_start)) as usize);
-                            let part = Part::new(id.clone(), part_start, part_data);
+                        trace!("Pushing part to queue from cache: {:?}", part_start..part_end);
+                        part_queue_producer.push(Ok(part));
 
-                            trace!("Pushing part to queue from cache: {:?}", part_start..part_end);
-                            part_queue_producer.push(Ok(part));
-
-                            *remaining_range = part_end..remaining_range.end;
-                            metrics::counter!("prefetch.parquet_cache_hits").increment(1);
-                            if remaining_range.is_empty() {
-                                return true;
-                            }
-                        } else {
-                            metrics::counter!("prefetch.parquet_cache_misses").increment(1);
-                            return false; // Return early since no point going forward from here
+                        *remaining_range = part_end..remaining_range.end;
+                        metrics::counter!("prefetch.parquet_cache_hits").increment(1);
+                        if remaining_range.is_empty() {
+                            return true;
                         }
+                    } else {
+                        metrics::counter!("prefetch.parquet_cache_misses").increment(1);
+                        return false; // Return early since no point going forward from here
                     }
                 }
             }
@@ -328,10 +440,10 @@ async fn fetch_from_client<Client>(
     id: &ObjectId,
     remaining_range: &mut Range<u64>,
     preferred_part_size: usize,
-    in_mem_cache: &InMemoryCacheRef,
+    in_memory_record: &InMemoryRecord,
     cols: &mut RowgroupCols,
     part_queue_producer: &PartQueueProducer<Client::ClientError>,
-    metadata: &Option<MetadataRanges>,
+    metadata: &MetadataRanges,
 ) -> Result<(), PrefetchReadError<Client::ClientError>>
 where
     Client: ObjectClient + Send + Sync + 'static,
@@ -345,20 +457,12 @@ where
 
     match get_from_client(client, bucket, id, prefetch_range, preferred_part_size).await {
         Ok(parts) => {
-            let mut cache_guard = in_mem_cache.write().await;
-            let in_memory_record = cache_guard.get_or_insert_with(|| {
-                InMemoryRecord {
-                    in_memory_cache: HashMap::new(),
-                    lru_cache: AsyncRwLock::new(LruCache::new(1000 * 1024 * 1024)),
-                }
-                // 1 GB limit
-            });
-
             for part in parts {
+                let mut in_memory_cache = in_memory_record.in_memory_cache.write().await;
                 let part_range = part.offset()..part.offset() + part.len() as u64;
                 // list of row group cols and the ranges they have
                 let mut ranges: Vec<(_, _)> = Vec::new();
-                for (row_group_col, map) in in_memory_record.in_memory_cache.iter() {
+                for (row_group_col, map) in in_memory_cache.iter() {
                     ranges.push((*row_group_col, map.keys()));
                 }
 
@@ -388,20 +492,8 @@ where
                 *cols = remaining_cols;
 
                 for (row_group_col, _col_range) in new_cols {
-                    if metadata.is_none() {
-                        break;
-                    }
-
-                    let col_cache = in_memory_record
-                        .in_memory_cache
-                        .entry(row_group_col)
-                        .or_insert_with(BTreeMap::new);
-                    let col_range = metadata
-                        .as_ref()
-                        .unwrap()
-                        .rowgroup_col_ranges
-                        .get(&row_group_col)
-                        .unwrap();
+                    let col_cache = in_memory_cache.entry(row_group_col).or_insert_with(BTreeMap::new);
+                    let col_range = metadata.rowgroup_col_ranges.get(&row_group_col).unwrap();
                     if let Err(e) = merge_ranges(
                         col_cache,
                         part_range.clone(),
@@ -415,8 +507,8 @@ where
                         id,
                         row_group_col,
                         &part,
-                        &mut in_memory_record.lru_cache,
-                        &mut in_memory_record.in_memory_cache,
+                        &in_memory_record.lru_cache,
+                        &mut in_memory_cache,
                     )
                     .await;
                 }
@@ -441,7 +533,7 @@ async fn lru_record(
     id: &ObjectId,
     row_group_col: (usize, usize),
     part: &Part,
-    lru_cache: &mut LruCacheRef,
+    lru_cache: &LruCacheRef,
     cache: &mut InMemoryCache,
 ) {
     let key = CacheKey {
@@ -753,13 +845,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_lru_record() {
-        let mut lru_cache = AsyncRwLock::new(LruCache::new(1000));
+        let lru_cache = AsyncRwLock::new(LruCache::new(1000));
         let mut cache = InMemoryCache::new();
         let id = ObjectId::new("test".to_string(), ETag::for_tests());
         let row_group_col = (0, 0);
         let part = Part::new(id.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[1; 100])));
 
-        lru_record(&id, row_group_col, &part, &mut lru_cache, &mut cache).await;
+        lru_record(&id, row_group_col, &part, &lru_cache, &mut cache).await;
 
         // Check if the entry was added to the LRU cache
         {
@@ -780,7 +872,7 @@ mod tests {
 
         // Add more entries to test eviction
         let part2 = Part::new(id.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[2; 901])));
-        lru_record(&id, (0, 1), &part2, &mut lru_cache, &mut cache).await;
+        lru_record(&id, (0, 1), &part2, &lru_cache, &mut cache).await;
 
         // Check if the first entry was evicted
         {
@@ -802,7 +894,7 @@ mod tests {
         // Test with a different file id
         let id2 = ObjectId::new("test2".to_string(), ETag::for_tests());
         let part3 = Part::new(id2.clone(), 0, ChecksummedBytes::new(Bytes::from_static(&[3; 50])));
-        lru_record(&id2, (0, 0), &part3, &mut lru_cache, &mut cache).await;
+        lru_record(&id2, (0, 0), &part3, &lru_cache, &mut cache).await;
 
         // Check if both entries are present (total size is less than 1000)
         {

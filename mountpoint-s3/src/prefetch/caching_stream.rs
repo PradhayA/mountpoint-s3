@@ -16,8 +16,6 @@ use crate::prefetch::part_stream::{ObjectPartStream, RequestRange};
 use crate::prefetch::task::RequestTask;
 use crate::prefetch::PrefetchReadError;
 
-use super::CacheEntry;
-
 /// [ObjectPartStream] implementation which maintains a [DataCache] for the object data
 /// retrieved by an [ObjectClient].
 #[derive(Debug)]
@@ -48,7 +46,6 @@ where
         if_match: ETag,
         range: RequestRange,
         _preferred_part_size: usize,
-        _cached_structure: CacheEntry,
     ) -> RequestTask<<Client as ObjectClient>::ClientError>
     where
         Client: ObjectClient + Clone + Send + Sync + 'static,
@@ -326,7 +323,7 @@ mod tests {
     use mountpoint_s3_client::mock_client::{MockClient, MockClientConfig, MockObject, Operation};
     use test_case::test_case;
 
-    use crate::{data_cache::InMemoryDataCache, prefetch::CacheEntry};
+    use crate::data_cache::InMemoryDataCache;
 
     use super::*;
 
@@ -370,15 +367,7 @@ mod tests {
         let first_read_count = {
             // First request (from client)
             let get_object_counter = mock_client.new_counter(Operation::GetObject);
-            let request_task = stream.spawn_get_object_request(
-                &mock_client,
-                bucket,
-                key,
-                etag.clone(),
-                range,
-                0,
-                CacheEntry::default(),
-            );
+            let request_task = stream.spawn_get_object_request(&mock_client, bucket, key, etag.clone(), range, 0);
             compare_read(&id, &object, request_task);
             get_object_counter.count()
         };
@@ -387,15 +376,7 @@ mod tests {
         let second_read_count = {
             // Second request (from cache)
             let get_object_counter = mock_client.new_counter(Operation::GetObject);
-            let request_task = stream.spawn_get_object_request(
-                &mock_client,
-                bucket,
-                key,
-                etag.clone(),
-                range,
-                0,
-                CacheEntry::default(),
-            );
+            let request_task = stream.spawn_get_object_request(&mock_client, bucket, key, etag.clone(), range, 0);
             compare_read(&id, &object, request_task);
             get_object_counter.count()
         };
@@ -430,15 +411,7 @@ mod tests {
         for offset in [0, 512 * KB, 1 * MB, 4 * MB, 9 * MB] {
             for preferred_size in [1 * KB, 512 * KB, 4 * MB, 12 * MB, 16 * MB] {
                 let range = RequestRange::new(object_size, offset as u64, preferred_size);
-                let request_task = stream.spawn_get_object_request(
-                    &mock_client,
-                    bucket,
-                    key,
-                    etag.clone(),
-                    range,
-                    0,
-                    CacheEntry::default(),
-                );
+                let request_task = stream.spawn_get_object_request(&mock_client, bucket, key, etag.clone(), range, 0);
                 compare_read(&id, &object, request_task);
             }
         }
