@@ -6,3 +6,5 @@
 out/
 # Python stuff
 examples/**/venv
+mountpoint-s3/scripts/parquet_prefetch_benchmarks/**/venv
+mountpoinr-s3/scripts/parquet_prefetch_benchmarks/dataset
